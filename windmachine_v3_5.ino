@@ -110,7 +110,10 @@ void setupConfig() {
 ////////////////////////////////////////////////////////////////////////////////
 float maxSpeed    = 30000;
 float accel       = 1000;
+float jerk        = 5000; // Voor S-Curve
 float targetSpeed = 3000;
+
+float junctionDeviation = 0.05;
 
 float homeFastSpeed     = 3000;
 float homeSlowSpeed     = 120;
@@ -119,6 +122,10 @@ long homeBackoffSteps   = 1000;
 struct Move {
   long steps[NUM_AXES];
   float feed;
+  float unitVector[NUM_AXES];
+  float entrySpeed;
+  float maxEntrySpeed;
+  float distance;
 };
 
 const int BUFFER_SIZE = 16;
@@ -126,7 +133,7 @@ Move moveBuffer[BUFFER_SIZE];
 volatile int head = 0;
 volatile int tail = 0;
 
-char serialBuffer[64];
+char serialBuffer[128];
 int serialIndex = 0;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -158,6 +165,7 @@ volatile long dominantStepsRemaining = 0;
 
 volatile bool homed[NUM_AXES] = {false, false, false, false};
 volatile float currentSpeed = 0;
+volatile float currentAccel = 0;
 bool absoluteMode = true;
 
 unsigned long lastRampMicros = 0;
@@ -252,7 +260,7 @@ void startMove(long stepsX, long stepsY, long stepsZ, long stepsA, float feed) {
 
   // 🎯 Speed setup (veilig begrensd)
   targetSpeed = constrain(feed, 50, maxSpeed);
-  currentSpeed = 0;  // 🔥 belangrijk voor ramp restart
+  // currentSpeed wordt nu door de planner gezet voor look-ahead
 
   lastRampMicros = micros();
   state = MOVING;
@@ -406,19 +414,49 @@ void handleHoming() {
 void updateRamp() {
   if (state != MOVING) {
     currentSpeed = 0;
+    currentAccel = 0;
     return;
   }
 
   unsigned long now = micros();
   float dt = (now - lastRampMicros) / 1000000.0; 
+  if (dt > 0.1) dt = 0.01;
   lastRampMicros = now;
+
+  // Bepaal de doelsnelheid voor het einde van deze move (v_exit is v_entry van de volgende move)
+  float exitSpeed = 0;
+  if (head != tail) {
+     exitSpeed = moveBuffer[tail].entrySpeed;
+  }
+
+  // Eenvoudige rem-check: als we sneller gaan dan toegestaan voor de resterende afstand
+  float progress = 0;
+  if (dominantStepsTotal > 0) {
+    progress = (float)dominantStepsRemaining / dominantStepsTotal;
+  }
+  float currentMoveDist = moveBuffer[(tail - 1 + BUFFER_SIZE) % BUFFER_SIZE].distance;
+  float maxSafeSpeed = sqrt(exitSpeed * exitSpeed + 2.0 * accel * progress * currentMoveDist);
+  float effectiveTarget = min(targetSpeed, maxSafeSpeed);
+
+  float speedDiff = effectiveTarget - currentSpeed;
+
+  // S-Curve acceleratie
+  float desiredAccel = speedDiff * 10.0;
+  desiredAccel = constrain(desiredAccel, -accel, accel);
+
+  if (currentAccel < desiredAccel) {
+    currentAccel += jerk * dt;
+    if (currentAccel > desiredAccel) currentAccel = desiredAccel;
+  } else if (currentAccel > desiredAccel) {
+    currentAccel -= jerk * dt;
+    if (currentAccel < desiredAccel) currentAccel = desiredAccel;
+  }
   
-  if (currentSpeed < targetSpeed) {
-    currentSpeed += accel * dt; 
-    if (currentSpeed > targetSpeed) currentSpeed = targetSpeed;
-  } else if (currentSpeed > targetSpeed) {
-    currentSpeed -= accel * dt;
-    if (currentSpeed < targetSpeed) currentSpeed = targetSpeed;
+  currentSpeed += currentAccel * dt;
+
+  if (abs(speedDiff) < 1.0 && abs(currentAccel) < 10.0) {
+    currentSpeed = effectiveTarget;
+    currentAccel = 0;
   }
 
   float safeSpeed = max(currentSpeed, 10.0);
@@ -428,10 +466,10 @@ void updateRamp() {
 ////////////////////////////////////////////////////////////////////////////////
 // 💬 G-CODE PARSER & COMMUNICATIE
 ////////////////////////////////////////////////////////////////////////////////
-void sendStatusMessage(const char* title, const char* message) {
+void sendStatusMessage(const __FlashStringHelper* title, const __FlashStringHelper* message) {
   Serial.println(F("\n--------------------------------------------------"));
   Serial.print(F(" >> ")); Serial.println(title);
-  if (message && message[0] != '\0') {
+  if (message) {
     Serial.print(F("    ")); Serial.println(message);
   }
   Serial.println(F("--------------------------------------------------"));
@@ -468,24 +506,24 @@ void processCommand(char* line) {
 
   if (strcmp(start, "G90") == 0) {
     absoluteMode = true; 
-    sendStatusMessage("MODUS: ABSOLUUT (G90)", "Posities berekend vanaf machine-nulpunt.");
+    sendStatusMessage(F("MODUS: ABSOLUUT (G90)"), F("Posities berekend vanaf machine-nulpunt."));
     Serial.println(F("ok"));
     return; 
   }
 
   if (strcmp(start, "G91") == 0) {
     absoluteMode = false; 
-    sendStatusMessage("MODUS: RELATIEF (G91)", "Posities berekend vanaf huidige locatie.");
+    sendStatusMessage(F("MODUS: RELATIEF (G91)"), F("Posities berekend vanaf huidige locatie."));
     Serial.println(F("ok"));
     return; 
   }
 
   if (strcmp(start, "M114") == 0) {
     Serial.println(F("\n--- ACTUELE MACHINE POSITIE ---"));
-    const char labels[] = {'X', 'Y', 'Z', 'A'};
+    static const char labels[] PROGMEM = "XYZA";
     for (int i = 0; i < NUM_AXES; i++) {
       float pos = (float)currentPosition[i] / axes[i].stepsPerMM;
-      Serial.print(labels[i]); Serial.print(F(": "));
+      Serial.print((char)pgm_read_byte(&labels[i])); Serial.print(F(": "));
       Serial.print(pos); 
       if (i == 3) {
         Serial.print(F("°  "));
@@ -542,10 +580,40 @@ void processCommand(char* line) {
     if (hasMovement) {
       int nextHead = (head + 1) % BUFFER_SIZE;
       if (nextHead != tail) {
+        float distance = 0;
         for (int i = 0; i < NUM_AXES; i++) {
           moveBuffer[head].steps[i] = stepsToMove[i];
+          float d_i = (float)stepsToMove[i] / axes[i].stepsPerMM;
+          distance += d_i * d_i;
         }
+        distance = sqrt(distance);
+        moveBuffer[head].distance = distance;
+
+        for (int i = 0; i < NUM_AXES; i++) {
+           moveBuffer[head].unitVector[i] = ((float)stepsToMove[i] / axes[i].stepsPerMM) / distance;
+        }
+
         moveBuffer[head].feed = feed;
+        moveBuffer[head].maxEntrySpeed = feed;
+        moveBuffer[head].entrySpeed = 0;
+
+        // Junction Deviation berekening
+        int prev = (head - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+        if (head != tail && prev != (tail - 1 + BUFFER_SIZE) % BUFFER_SIZE) {
+          float dot_product = 0;
+          for (int i = 0; i < NUM_AXES; i++) {
+            dot_product += moveBuffer[prev].unitVector[i] * moveBuffer[head].unitVector[i];
+          }
+          if (dot_product < 0.999) { // Alleen bij hoeken
+            float cos_theta = -dot_product;
+            float sin_theta_d2 = sqrt(0.5 * (1.0 - cos_theta));
+            if (sin_theta_d2 < 0.999) {
+              float v_junction = sqrt(accel * junctionDeviation * sin_theta_d2 / (1.0 - sin_theta_d2));
+              moveBuffer[head].maxEntrySpeed = min(feed, min(moveBuffer[prev].feed, v_junction));
+            }
+          }
+        }
+
         head = nextHead;
         Serial.println(F("ok"));
       } else {
@@ -639,15 +707,32 @@ void loop() {
       }
     } else if (serialIndex < (int)sizeof(serialBuffer) - 1) {
       serialBuffer[serialIndex++] = c;
+    } else {
+      // Buffer overflow protection: reset index if line too long
+      serialIndex = 0;
     }
   }
   
   if (state == IDLE && head != tail && homeState == HOME_IDLE) {
+    // Look-ahead: herbereken entry speeds in de buffer
+    float v_next = 0;
+    int i = (head - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+    while (i != (tail - 1 + BUFFER_SIZE) % BUFFER_SIZE) {
+       float v_entry = sqrt(v_next * v_next + 2 * accel * moveBuffer[i].distance);
+       moveBuffer[i].entrySpeed = min(moveBuffer[i].maxEntrySpeed, v_entry);
+       v_next = moveBuffer[i].entrySpeed;
+       if (i == tail) break;
+       i = (i - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+    }
+
     startMove(
       moveBuffer[tail].steps[0], moveBuffer[tail].steps[1], 
       moveBuffer[tail].steps[2], moveBuffer[tail].steps[3], 
       moveBuffer[tail].feed
     );
+    // Voor look-ahead zetten we de startSpeed op de entrySpeed van de huidige move
+    currentSpeed = moveBuffer[tail].entrySpeed;
+
     tail = (tail + 1) % BUFFER_SIZE;
   }
 
