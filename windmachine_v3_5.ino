@@ -126,6 +126,8 @@ struct Move {
   float entrySpeed;
   float maxEntrySpeed;
   float distance;
+  long stepsTotal;
+  long brakeSteps;
 };
 
 const int BUFFER_SIZE = 16;
@@ -174,12 +176,9 @@ unsigned long homingStart = 0;
 ////////////////////////////////////////////////////////////////////////////////
 // ⚡ LIMIT SWITCH CHECK
 ////////////////////////////////////////////////////////////////////////////////
-inline bool limitTriggered(int axisIndex) {
-  if (axisIndex < 0 || axisIndex >= NUM_AXES) return false;
-
+// Snelste check zonder debounce voor ISR/Homing
+inline bool limitTriggeredRaw(int axisIndex) {
   bool raw;
-  // Directe register-uitlezing voor ATmega328P (PINC)
-  // X=A3(PC3), Y=A4(PC4), Z=A5(PC5), A=A2(PC2)
   switch(axisIndex) {
     case 0: raw = !(PINC & (1 << 3)); break;
     case 1: raw = !(PINC & (1 << 4)); break;
@@ -187,19 +186,30 @@ inline bool limitTriggered(int axisIndex) {
     case 3: raw = !(PINC & (1 << 2)); break;
     default: return false;
   }
-
-  bool triggered = axes[axisIndex].isNC ? raw : !raw;
-  if (!triggered) return false;
-
-  // Anti-false trigger: bevestig na korte wachtperiode
-  delayMicroseconds(20);
-  switch(axisIndex) {
-    case 0: raw = !(PINC & (1 << 3)); break;
-    case 1: raw = !(PINC & (1 << 4)); break;
-    case 2: raw = !(PINC & (1 << 5)); break;
-    case 3: raw = !(PINC & (1 << 2)); break;
-  }
   return axes[axisIndex].isNC ? raw : !raw;
+}
+
+inline bool limitTriggered(int axisIndex) {
+  if (axisIndex < 0 || axisIndex >= NUM_AXES) return false;
+  if (!limitTriggeredRaw(axisIndex)) return false;
+
+  // Debounce in loop() is toegestaan
+  unsigned long start = micros();
+  while(micros() - start < 20);
+
+  return limitTriggeredRaw(axisIndex);
+}
+
+void recalculateBrakeSteps(int i) {
+  float v_entry = moveBuffer[i].entrySpeed;
+  float v_exit = (i == (head - 1 + BUFFER_SIZE) % BUFFER_SIZE) ? 0 : moveBuffer[(i + 1) % BUFFER_SIZE].entrySpeed;
+
+  // d_brake = (v_entry^2 - v_exit^2) / (2 * accel)
+  float d_brake = (v_entry * v_entry - v_exit * v_exit) / (2.0f * accel);
+  if (d_brake < 0) d_brake = 0;
+
+  // Convert mm to steps
+  moveBuffer[i].brakeSteps = (long)((d_brake / moveBuffer[i].distance) * moveBuffer[i].stepsTotal);
 }
 
 void startMove(long stepsX, long stepsY, long stepsZ, long stepsA, float feed) {
@@ -419,29 +429,27 @@ void updateRamp() {
   }
 
   unsigned long now = micros();
-  float dt = (now - lastRampMicros) / 1000000.0; 
-  if (dt > 0.1) dt = 0.01;
+  float dt = (now - lastRampMicros) / 1000000.0f;
+  if (dt > 0.1f) dt = 0.01f;
   lastRampMicros = now;
 
-  // Bepaal de doelsnelheid voor het einde van deze move (v_exit is v_entry van de volgende move)
-  float exitSpeed = 0;
+  // Bepaal doelsnelheid op basis van rem-afstand
+  float v_exit = 0;
   if (head != tail) {
-     exitSpeed = moveBuffer[tail].entrySpeed;
+    v_exit = moveBuffer[tail].entrySpeed;
   }
 
-  // Eenvoudige rem-check: als we sneller gaan dan toegestaan voor de resterende afstand
-  float progress = 0;
-  if (dominantStepsTotal > 0) {
-    progress = (float)dominantStepsRemaining / dominantStepsTotal;
+  // Als we binnen de rem-afstand zijn, moet de doelsnelheid v_exit zijn
+  float effectiveTarget = targetSpeed;
+  int currentMoveIdx = (tail - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+  if (dominantStepsRemaining <= moveBuffer[currentMoveIdx].brakeSteps) {
+    effectiveTarget = v_exit;
   }
-  float currentMoveDist = moveBuffer[(tail - 1 + BUFFER_SIZE) % BUFFER_SIZE].distance;
-  float maxSafeSpeed = sqrt(exitSpeed * exitSpeed + 2.0 * accel * progress * currentMoveDist);
-  float effectiveTarget = min(targetSpeed, maxSafeSpeed);
 
   float speedDiff = effectiveTarget - currentSpeed;
 
-  // S-Curve acceleratie
-  float desiredAccel = speedDiff * 10.0;
+  // S-Curve (Jerk-limited)
+  float desiredAccel = speedDiff * 10.0f;
   desiredAccel = constrain(desiredAccel, -accel, accel);
 
   if (currentAccel < desiredAccel) {
@@ -454,13 +462,15 @@ void updateRamp() {
   
   currentSpeed += currentAccel * dt;
 
-  if (abs(speedDiff) < 1.0 && abs(currentAccel) < 10.0) {
+  if (abs(speedDiff) < 2.0f && abs(currentAccel) < 20.0f) {
     currentSpeed = effectiveTarget;
     currentAccel = 0;
   }
 
-  float safeSpeed = max(currentSpeed, 10.0);
-  OCR1A = (2000000.0 / safeSpeed);
+  // Directe OCR1A berekening.
+  // Limiet op 31.0 om 16-bit overflow van OCR1A te voorkomen (2.000.000 / 65535 = 30.5)
+  float safeSpeed = (currentSpeed < 31.0f) ? 31.0f : currentSpeed;
+  OCR1A = (uint16_t)(2000000.0f / safeSpeed);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -483,6 +493,38 @@ float getAxisValue(const char* line, char axisLetter, float defaultVal, bool &fo
   }
   found = false;
   return defaultVal;
+}
+
+void recalculateBuffer() {
+  if (head == tail) return;
+
+  // 1. Backward pass: Zorg dat we kunnen remmen voor de volgende segmenten
+  float v_next = 0;
+  int i = (head - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+  while (true) {
+    float max_v = sqrt(v_next * v_next + 2.0 * accel * moveBuffer[i].distance);
+    moveBuffer[i].entrySpeed = min(moveBuffer[i].maxEntrySpeed, max_v);
+    v_next = moveBuffer[i].entrySpeed;
+
+    if (i == tail) break;
+    i = (i - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+  }
+
+  // 2. Forward pass: Zorg dat we kunnen versnellen vanaf het begin
+  float v_prev = (state == MOVING) ? currentSpeed : 0;
+  i = tail;
+  while (i != head) {
+    float max_v = sqrt(v_prev * v_prev + 2.0 * accel * moveBuffer[i].distance);
+    if (max_v < moveBuffer[i].entrySpeed) {
+       moveBuffer[i].entrySpeed = max_v;
+    }
+    // De exit snelheid van move i is de entry snelheid van i+1
+    // Maar we slaan hier de entry op.
+    v_prev = sqrt(moveBuffer[i].entrySpeed * moveBuffer[i].entrySpeed + 2.0 * accel * moveBuffer[i].distance);
+    v_prev = min(v_prev, moveBuffer[i].feed);
+
+    i = (i + 1) % BUFFER_SIZE;
+  }
 }
 
 void processCommand(char* line) {
@@ -581,30 +623,34 @@ void processCommand(char* line) {
       int nextHead = (head + 1) % BUFFER_SIZE;
       if (nextHead != tail) {
         float distance = 0;
+        long maxSteps = 0;
         for (int i = 0; i < NUM_AXES; i++) {
           moveBuffer[head].steps[i] = stepsToMove[i];
+          if (labs(stepsToMove[i]) > maxSteps) maxSteps = labs(stepsToMove[i]);
           float d_i = (float)stepsToMove[i] / axes[i].stepsPerMM;
           distance += d_i * d_i;
         }
         distance = sqrt(distance);
         moveBuffer[head].distance = distance;
+        moveBuffer[head].stepsTotal = maxSteps;
 
+        float invDist = 1.0 / distance;
         for (int i = 0; i < NUM_AXES; i++) {
-           moveBuffer[head].unitVector[i] = ((float)stepsToMove[i] / axes[i].stepsPerMM) / distance;
+           moveBuffer[head].unitVector[i] = ((float)stepsToMove[i] / axes[i].stepsPerMM) * invDist;
         }
 
         moveBuffer[head].feed = feed;
         moveBuffer[head].maxEntrySpeed = feed;
         moveBuffer[head].entrySpeed = 0;
 
-        // Junction Deviation berekening
+        // Junction Deviation
         int prev = (head - 1 + BUFFER_SIZE) % BUFFER_SIZE;
         if (head != tail && prev != (tail - 1 + BUFFER_SIZE) % BUFFER_SIZE) {
           float dot_product = 0;
           for (int i = 0; i < NUM_AXES; i++) {
             dot_product += moveBuffer[prev].unitVector[i] * moveBuffer[head].unitVector[i];
           }
-          if (dot_product < 0.999) { // Alleen bij hoeken
+          if (dot_product < 0.999) {
             float cos_theta = -dot_product;
             float sin_theta_d2 = sqrt(0.5 * (1.0 - cos_theta));
             if (sin_theta_d2 < 0.999) {
@@ -615,6 +661,13 @@ void processCommand(char* line) {
         }
 
         head = nextHead;
+        recalculateBuffer();
+        // Bereken brake steps voor alle moves in de buffer
+        int b = tail;
+        while(b != head) {
+          recalculateBrakeSteps(b);
+          b = (b + 1) % BUFFER_SIZE;
+        }
         Serial.println(F("ok"));
       } else {
         Serial.println(F("ERROR: Planner buffer vol! Wacht even..."));
@@ -629,27 +682,24 @@ void processCommand(char* line) {
 // ⏱️ TIMER ISR (Veilig gemaakt)
 ////////////////////////////////////////////////////////////////////////////////
 ISR(TIMER1_COMPA_vect) {
-  // AANPASSING HIER: '&& homeState != HOME_BACKOFF' is toegevoegd zodat de as mag bewegen tijdens de back-off
-  if (homeState != HOME_IDLE && homingAxis >= 0 && limitTriggered(homingAxis) && homeState != HOME_BACKOFF) {
-    // Schakel alle stappen uit (Direct Port Manipulation)
-    SET_STEP_X(LOW);
-    SET_STEP_Y(LOW);
-    SET_STEP_Z(LOW);
-    SET_STEP_A(LOW);
-    state = IDLE; 
-    dominantStepsRemaining = 0;
-    return;
+  // Snelle check voor homing limit in ISR zonder debounce
+  if (homeState != HOME_IDLE && homingAxis >= 0 && homeState != HOME_BACKOFF) {
+    if (limitTriggeredRaw(homingAxis)) {
+      SET_STEP_X(LOW); SET_STEP_Y(LOW); SET_STEP_Z(LOW); SET_STEP_A(LOW);
+      state = IDLE; dominantStepsRemaining = 0;
+      return;
+    }
   }
 
   if (state != MOVING || dominantStepsRemaining <= 0) {
-    state = IDLE; 
-    return;
+    state = IDLE; return;
   }
 
   static bool phase = false;
   phase = !phase; 
 
   if (phase) {
+    // Unrolled loop voor maximale snelheid
     if (doStep[0]) SET_STEP_X(HIGH);
     if (doStep[1]) SET_STEP_Y(HIGH);
     if (doStep[2]) SET_STEP_Z(HIGH);
@@ -660,16 +710,20 @@ ISR(TIMER1_COMPA_vect) {
     if (doStep[2]) { SET_STEP_Z(LOW); currentPosition[2] += moveDir[2]; }
     if (doStep[3]) { SET_STEP_A(LOW); currentPosition[3] += moveDir[3]; }
 
-    for (int i = 0; i < NUM_AXES; i++) {
-      if (dominantStepsRemaining > 1) { 
-        err[i] -= stepCount[i];
-        if (err[i] < 0) {
-          doStep[i] = true;
-          err[i] += dominantStepsTotal;
-        } else {
-          doStep[i] = false;
-        }
-      }
+    // Bresenham unrolled
+    if (dominantStepsRemaining > 1) {
+      // X
+      err[0] -= stepCount[0];
+      if (err[0] < 0) { doStep[0] = true; err[0] += dominantStepsTotal; } else { doStep[0] = false; }
+      // Y
+      err[1] -= stepCount[1];
+      if (err[1] < 0) { doStep[1] = true; err[1] += dominantStepsTotal; } else { doStep[1] = false; }
+      // Z
+      err[2] -= stepCount[2];
+      if (err[2] < 0) { doStep[2] = true; err[2] += dominantStepsTotal; } else { doStep[2] = false; }
+      // A
+      err[3] -= stepCount[3];
+      if (err[3] < 0) { doStep[3] = true; err[3] += dominantStepsTotal; } else { doStep[3] = false; }
     }
     dominantStepsRemaining--;
   }
@@ -708,29 +762,19 @@ void loop() {
     } else if (serialIndex < (int)sizeof(serialBuffer) - 1) {
       serialBuffer[serialIndex++] = c;
     } else {
-      // Buffer overflow protection: reset index if line too long
       serialIndex = 0;
     }
   }
   
   if (state == IDLE && head != tail && homeState == HOME_IDLE) {
-    // Look-ahead: herbereken entry speeds in de buffer
-    float v_next = 0;
-    int i = (head - 1 + BUFFER_SIZE) % BUFFER_SIZE;
-    while (i != (tail - 1 + BUFFER_SIZE) % BUFFER_SIZE) {
-       float v_entry = sqrt(v_next * v_next + 2 * accel * moveBuffer[i].distance);
-       moveBuffer[i].entrySpeed = min(moveBuffer[i].maxEntrySpeed, v_entry);
-       v_next = moveBuffer[i].entrySpeed;
-       if (i == tail) break;
-       i = (i - 1 + BUFFER_SIZE) % BUFFER_SIZE;
-    }
+    // Look-ahead: herberekening gebeurt nu bij toevoegen aan buffer (recalculateBuffer)
 
     startMove(
       moveBuffer[tail].steps[0], moveBuffer[tail].steps[1], 
       moveBuffer[tail].steps[2], moveBuffer[tail].steps[3], 
       moveBuffer[tail].feed
     );
-    // Voor look-ahead zetten we de startSpeed op de entrySpeed van de huidige move
+    // Start met de entrySpeed die de planner heeft bepaald
     currentSpeed = moveBuffer[tail].entrySpeed;
 
     tail = (tail + 1) % BUFFER_SIZE;
