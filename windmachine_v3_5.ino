@@ -27,6 +27,22 @@
 #define DIR_PIN_A  3
 #define LIMIT_PIN_A A2
 
+// Port Manipulation Bitmasks
+#define STEP_MASK_X (1 << 4) // PD4
+#define DIR_MASK_X  (1 << 5) // PD5
+#define STEP_MASK_Y (1 << 6) // PD6
+#define DIR_MASK_Y  (1 << 7) // PD7
+#define STEP_MASK_A (1 << 2) // PD2
+#define DIR_MASK_A  (1 << 3) // PD3
+
+#define STEP_MASK_Z (1 << 0) // PB0
+#define DIR_MASK_Z  (1 << 1) // PB1
+
+#define LIMIT_MASK_X (1 << 3) // PC3
+#define LIMIT_MASK_Y (1 << 4) // PC4
+#define LIMIT_MASK_Z (1 << 5) // PC5
+#define LIMIT_MASK_A (1 << 2) // PC2
+
 ////////////////////////////////////////////////////////////////////////////////
 // ⚙️ BLOK 2: AS-CONFIGURATIE (Aangepast voor oneindige A-as)
 ////////////////////////////////////////////////////////////////////////////////
@@ -110,7 +126,7 @@ struct Move {
   float feed;
 };
 
-const int BUFFER_SIZE = 6;
+const int BUFFER_SIZE = 16;
 Move moveBuffer[BUFFER_SIZE];
 volatile int head = 0;
 volatile int tail = 0;
@@ -119,7 +135,7 @@ volatile int tail = 0;
 // 📊 STATUS VARIABELEN
 ////////////////////////////////////////////////////////////////////////////////
 enum MotionState { IDLE, MOVING };
-enum HomeState { HOME_IDLE, HOME_FAST_SEEK, HOME_BACKOFF, HOME_SLOW_SEEK };
+enum HomeState { HOME_IDLE, HOME_FAST_SEEK, HOME_BACKOFF, HOME_SLOW_SEEK, HOME_DELAY };
 
 volatile MotionState state = IDLE;
 volatile HomeState homeState = HOME_IDLE;
@@ -140,15 +156,37 @@ volatile bool homed[NUM_AXES] = {false, false, false, false};
 volatile float currentSpeed = 0;
 bool absoluteMode = true;
 
+char serialBuffer[128];
+int serialIdx = 0;
+
 unsigned long lastRampMicros = 0;
 unsigned long homingStart = 0;
+unsigned long homeWaitStart = 0;
+unsigned long homeWaitDuration = 0;
+HomeState nextHomeState = HOME_IDLE;
 
 ////////////////////////////////////////////////////////////////////////////////
 // ⚡ LIMIT SWITCH CHECK
 ////////////////////////////////////////////////////////////////////////////////
 inline bool limitTriggered(int axisIndex) {
   if (axisIndex < 0 || axisIndex >= NUM_AXES) return false;
-  bool raw = (digitalRead(axes[axisIndex].limitPin) == LOW); // LOW = pin verbonden met GND (INPUT_PULLUP)
+
+  uint8_t mask;
+  switch (axisIndex) {
+    case 0: mask = LIMIT_MASK_X; break;
+    case 1: mask = LIMIT_MASK_Y; break;
+    case 2: mask = LIMIT_MASK_Z; break;
+    case 3: mask = LIMIT_MASK_A; break;
+    default: return false;
+  }
+
+  // Software debounce: sample 5 times
+  int triggeredCount = 0;
+  for (int i = 0; i < 5; i++) {
+    if (!(PINC & mask)) triggeredCount++; // LOW when triggered (INPUT_PULLUP)
+  }
+
+  bool raw = (triggeredCount >= 3); // Majority vote
   return axes[axisIndex].isNC ? raw : !raw;
 }
 
@@ -176,7 +214,20 @@ void startMove(long stepsX, long stepsY, long stepsZ, long stepsA, float feed) {
       bool dir = (steps[i] > 0);
       if (axes[i].invertDir) dir = !dir;
 
-      digitalWrite(axes[i].dirPin, dir ? HIGH : LOW);
+      switch (i) {
+        case 0: // X
+          if (dir) PORTD |= DIR_MASK_X; else PORTD &= ~DIR_MASK_X;
+          break;
+        case 1: // Y
+          if (dir) PORTD |= DIR_MASK_Y; else PORTD &= ~DIR_MASK_Y;
+          break;
+        case 2: // Z
+          if (dir) PORTB |= DIR_MASK_Z; else PORTB &= ~DIR_MASK_Z;
+          break;
+        case 3: // A
+          if (dir) PORTD |= DIR_MASK_A; else PORTD &= ~DIR_MASK_A;
+          break;
+      }
       moveDir[i] = (steps[i] > 0) ? 1 : -1;
     }
   }
@@ -273,18 +324,10 @@ void handleHoming() {
     case HOME_FAST_SEEK:
       if (hit) {
         state = IDLE;
-        delay(150);
-        homeState = HOME_BACKOFF;
-        
-        long backoffAmt = axes[homingAxis].homeDirNegative ? homeBackoffSteps : -homeBackoffSteps;
-        startMove(
-          (homingAxis == 0 ? backoffAmt : 0),
-          (homingAxis == 1 ? backoffAmt : 0),
-          (homingAxis == 2 ? backoffAmt : 0),
-          (homingAxis == 3 ? backoffAmt : 0),
-          homeSlowSpeed
-        );
-        Serial.println(" -> Hit, backing off...");
+        homeWaitStart = millis();
+        homeWaitDuration = 150;
+        homeState = HOME_DELAY;
+        nextHomeState = HOME_BACKOFF;
       }
       break;
 
@@ -293,19 +336,10 @@ void handleHoming() {
       if (!limitTriggered(homingAxis)) {
         // Sensor is vrij: stop de beweging, wacht kort en start de langzame seek
         state = IDLE;
-        delay(150);
-        homeState = HOME_SLOW_SEEK;
-        
-        // Bepaal de langzame zoekrichting
-        long slowSeek = axes[homingAxis].homeDirNegative ? -100000 : 100000;
-        startMove(
-          (homingAxis == 0 ? slowSeek : 0),
-          (homingAxis == 1 ? slowSeek : 0),
-          (homingAxis == 2 ? slowSeek : 0),
-          (homingAxis == 3 ? slowSeek : 0),
-          homeSlowSpeed
-        );
-        Serial.println(" -> Sensor vrij, seeking slow...");
+        homeWaitStart = millis();
+        homeWaitDuration = 150;
+        homeState = HOME_DELAY;
+        nextHomeState = HOME_SLOW_SEEK;
       } else {
         // De sensor is nog steeds ingedrukt. 
         // We sturen een geforceerde, kleine beweging de andere kant op om de sensor fysiek te verlaten.
@@ -331,7 +365,7 @@ void handleHoming() {
         currentPosition[homingAxis] = 0; 
         homed[homingAxis] = true;
 
-        Serial.print("AXIS "); Serial.print(homingAxis); Serial.println(" HOMED OK.");
+        Serial.print(F("AXIS ")); Serial.print(homingAxis); Serial.println(F(" HOMED OK."));
 
         int next = -1;
         if (homingAxis == 2) next = 1;      // Na Z komt Y
@@ -339,8 +373,46 @@ void handleHoming() {
         else if (homingAxis == 0) next = 3; // Na X komt A
         else if (homingAxis == 3) next = -1;
 
-        delay(200);
-        startHomingAxis(next);
+        homeWaitStart = millis();
+        homeWaitDuration = 200;
+        homeState = HOME_DELAY;
+        // Gebruik een tijdelijke variabele om de volgende as op te slaan
+        // Maar startHomingAxis moet direct weten welke as.
+        // We kunnen homingAxis gebruiken als indicator voor de volgende as.
+        homingAxis = next;
+        nextHomeState = HOME_IDLE; // Indicator om startHomingAxis aan te roepen
+      }
+      break;
+
+    case HOME_DELAY:
+      if (millis() - homeWaitStart >= homeWaitDuration) {
+        if (nextHomeState == HOME_IDLE) {
+           startHomingAxis(homingAxis);
+        } else {
+           homeState = nextHomeState;
+           // Herstart beweging indien nodig
+           if (homeState == HOME_BACKOFF) {
+              long backoffAmt = axes[homingAxis].homeDirNegative ? homeBackoffSteps : -homeBackoffSteps;
+              startMove(
+                (homingAxis == 0 ? backoffAmt : 0),
+                (homingAxis == 1 ? backoffAmt : 0),
+                (homingAxis == 2 ? backoffAmt : 0),
+                (homingAxis == 3 ? backoffAmt : 0),
+                homeSlowSpeed
+              );
+              Serial.println(F(" -> Hit, backing off..."));
+           } else if (homeState == HOME_SLOW_SEEK) {
+              long slowSeek = axes[homingAxis].homeDirNegative ? -100000 : 100000;
+              startMove(
+                (homingAxis == 0 ? slowSeek : 0),
+                (homingAxis == 1 ? slowSeek : 0),
+                (homingAxis == 2 ? slowSeek : 0),
+                (homingAxis == 3 ? slowSeek : 0),
+                homeSlowSpeed
+              );
+              Serial.println(F(" -> Sensor vrij, seeking slow..."));
+           }
+        }
       }
       break;
   }
@@ -374,83 +446,80 @@ void updateRamp() {
 ////////////////////////////////////////////////////////////////////////////////
 // 💬 G-CODE PARSER & COMMUNICATIE
 ////////////////////////////////////////////////////////////////////////////////
-void sendStatusMessage(String title, String message) {
-  Serial.println("\n--------------------------------------------------");
-  Serial.print(" >> "); Serial.println(title);
-  if (message != "") {
-    Serial.print("    "); Serial.println(message);
+void sendStatusMessage(const __FlashStringHelper* title, const __FlashStringHelper* message) {
+  Serial.println(F("\n--------------------------------------------------"));
+  Serial.print(F(" >> ")); Serial.println(title);
+  if (message != (const __FlashStringHelper*)NULL) {
+    Serial.print(F("    ")); Serial.println(message);
   }
-  Serial.println("--------------------------------------------------");
+  Serial.println(F("--------------------------------------------------"));
 }
 
-float getAxisValue(String &line, char axisLetter, float defaultVal, bool &found) {
-  int idx = line.indexOf(axisLetter);
-  if (idx != -1) {
+float getAxisValue(char* line, char axisLetter, float defaultVal, bool &found) {
+  char* ptr = strchr(line, axisLetter);
+  if (ptr != NULL) {
     found = true;
-    int endIdx = idx + 1;
-    while (endIdx < line.length()) {
-      char c = line.charAt(endIdx);
-      if ((c >= '0' && c <= '9') || c == '.' || c == '-') endIdx++;
-      else break;
-    }
-    return line.substring(idx + 1, endIdx).toFloat();
+    return strtof(ptr + 1, NULL);
   }
   found = false;
   return defaultVal;
 }
 
-void processCommand(String line) {
-  line.trim();
-  line.toUpperCase();
-  if (line.length() == 0) return;
+void processCommand(char* line) {
+  // Trim and uppercase
+  char* start = line;
+  while (*start && isspace(*start)) start++;
+  if (*start == '\0') return;
 
-  if (line == "G28" || line == "HOME") {
+  for (char* p = start; *p; p++) *p = toupper(*p);
+
+  if (strcmp(start, "G28") == 0 || strcmp(start, "HOME") == 0) {
     startHomingSequence();
     return;
   }
 
-  if (line == "G90") { 
+  if (strcmp(start, "G90") == 0) {
     absoluteMode = true; 
-    sendStatusMessage("MODUS: ABSOLUUT (G90)", "Posities berekend vanaf machine-nulpunt.");
-    Serial.println("ok");
+    sendStatusMessage(F("MODUS: ABSOLUUT (G90)"), F("Posities berekend vanaf machine-nulpunt."));
+    Serial.println(F("ok"));
     return; 
   }
 
-  if (line == "G91") { 
+  if (strcmp(start, "G91") == 0) {
     absoluteMode = false; 
-    sendStatusMessage("MODUS: RELATIEF (G91)", "Posities berekend vanaf huidige locatie.");
-    Serial.println("ok");
+    sendStatusMessage(F("MODUS: RELATIEF (G91)"), F("Posities berekend vanaf huidige locatie."));
+    Serial.println(F("ok"));
     return; 
   }
 
-  if (line == "M114") {
-    Serial.println("\n--- ACTUELE MACHINE POSITIE ---");
+  if (strcmp(start, "M114") == 0) {
+    Serial.println(F("\n--- ACTUELE MACHINE POSITIE ---"));
     char labels[] = {'X', 'Y', 'Z', 'A'};
     for (int i = 0; i < NUM_AXES; i++) {
       float pos = (float)currentPosition[i] / axes[i].stepsPerMM;
-      Serial.print(labels[i]); Serial.print(": "); 
+      Serial.print(labels[i]); Serial.print(F(": "));
       Serial.print(pos); 
       if (i == 3) {
-        Serial.print("°  ");
+        Serial.print(F("°  "));
       } else {
-        Serial.print("mm  ");
+        Serial.print(F("mm  "));
       }
     }
-    Serial.println("\n-------------------------------");
-    Serial.println("ok");
+    Serial.println(F("\n-------------------------------"));
+    Serial.println(F("ok"));
     return;
   }
  
-  if (line.charAt(0) == 'G') {
+  if (start[0] == 'G') {
     for(int i = 0; i < NUM_AXES; i++) {
         if (!homed[i]) { 
-          Serial.println("ERROR: Systeem niet veilig. Voer eerst G28 uit!"); 
+          Serial.println(F("ERROR: Systeem niet veilig. Voer eerst G28 uit!"));
           return;
         }
     }
 
     bool fFound;
-    float feed = getAxisValue(line, 'F', targetSpeed, fFound);
+    float feed = getAxisValue(start, 'F', targetSpeed, fFound);
 
     long stepsToMove[NUM_AXES] = {0, 0, 0, 0};
     bool axisIncluded[NUM_AXES] = {false, false, false, false};
@@ -458,7 +527,7 @@ void processCommand(String line) {
     bool hasMovement = false;
 
     for (int i = 0; i < NUM_AXES; i++) {
-      float val = getAxisValue(line, axisChars[i], 0.0, axisIncluded[i]);
+      float val = getAxisValue(start, axisChars[i], 0.0, axisIncluded[i]);
       if (axisIncluded[i]) {
         float currentPosUnit = (float)currentPosition[i] / axes[i].stepsPerMM;
         
@@ -471,13 +540,13 @@ void processCommand(String line) {
 
         if (i != 3) {
           if (newPosUnit < 0.0 || newPosUnit > axes[i].maxTravelMM) {
-            Serial.print("ALARM: Soft limit bereikt op "); Serial.print(axisChars[i]);
-            Serial.print(" (Max: "); Serial.print(axes[i].maxTravelMM); Serial.println("mm)");
+            Serial.print(F("ALARM: Soft limit bereikt op ")); Serial.print(axisChars[i]);
+            Serial.print(F(" (Max: ")); Serial.print(axes[i].maxTravelMM); Serial.println(F("mm)"));
             return;
           }
         }
 
-        stepsToMove[i] = (long)(deltaUnit * axes[i].stepsPerMM);
+        stepsToMove[i] = lround(deltaUnit * axes[i].stepsPerMM);
         if (stepsToMove[i] != 0) hasMovement = true;
       }
     }
@@ -490,12 +559,12 @@ void processCommand(String line) {
         }
         moveBuffer[head].feed = feed;
         head = nextHead;
-        Serial.println("ok");
+        Serial.println(F("ok"));
       } else {
-        Serial.println("ERROR: Planner buffer vol! Wacht even...");
+        Serial.println(F("ERROR: Planner buffer vol! Wacht even..."));
       }
     } else {
-      Serial.println("ok");
+      Serial.println(F("ok"));
     }
   }
 }
@@ -507,9 +576,9 @@ ISR(TIMER1_COMPA_vect) {
   // AANPASSING HIER: '&& homeState != HOME_BACKOFF' is toegevoegd zodat de as mag bewegen tijdens de back-off
   if (homeState != HOME_IDLE && homingAxis >= 0 && limitTriggered(homingAxis) && homeState != HOME_BACKOFF) {
     // Schakel alle stappen uit
-    for (int i = 0; i < NUM_AXES; i++) {
-      digitalWrite(axes[i].stepPin, LOW);
-    }
+    PORTD &= ~(STEP_MASK_X | STEP_MASK_Y | STEP_MASK_A);
+    PORTB &= ~STEP_MASK_Z;
+
     state = IDLE; 
     dominantStepsRemaining = 0;
     return;
@@ -524,15 +593,17 @@ ISR(TIMER1_COMPA_vect) {
   phase = !phase; 
 
   if (phase) {
-    for (int i = 0; i < NUM_AXES; i++) {
-      if (doStep[i]) digitalWrite(axes[i].stepPin, HIGH);
-    }
+    if (doStep[0]) PORTD |= STEP_MASK_X;
+    if (doStep[1]) PORTD |= STEP_MASK_Y;
+    if (doStep[2]) PORTB |= STEP_MASK_Z;
+    if (doStep[3]) PORTD |= STEP_MASK_A;
   } else {
+    if (doStep[0]) { PORTD &= ~STEP_MASK_X; currentPosition[0] += moveDir[0]; }
+    if (doStep[1]) { PORTD &= ~STEP_MASK_Y; currentPosition[1] += moveDir[1]; }
+    if (doStep[2]) { PORTB &= ~STEP_MASK_Z; currentPosition[2] += moveDir[2]; }
+    if (doStep[3]) { PORTD &= ~STEP_MASK_A; currentPosition[3] += moveDir[3]; }
+
     for (int i = 0; i < NUM_AXES; i++) {
-      if (doStep[i]) {
-        digitalWrite(axes[i].stepPin, LOW);
-        currentPosition[i] += moveDir[i];
-      }
       if (dominantStepsRemaining > 1) { 
         err[i] -= stepCount[i];
         if (err[i] < 0) {
@@ -569,9 +640,17 @@ void setup() {
 }
 
 void loop() {
-  if (Serial.available() > 0) {
-    String line = Serial.readStringUntil('\n');
-    processCommand(line);
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      serialBuffer[serialIdx] = '\0';
+      if (serialIdx > 0) {
+        processCommand(serialBuffer);
+      }
+      serialIdx = 0;
+    } else if (serialIdx < sizeof(serialBuffer) - 1) {
+      serialBuffer[serialIdx++] = c;
+    }
   }
   
   if (state == IDLE && head != tail && homeState == HOME_IDLE) {
