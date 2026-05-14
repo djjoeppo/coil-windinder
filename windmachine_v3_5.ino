@@ -151,7 +151,9 @@ volatile bool limitHitDetected = false;
 
 // HX711 Load Cell
 long loadcell_offset = 0;
-float loadcell_divider = 186.5;
+float loadcell_divider = 40000.0;
+float filteredWeight = 0;
+float filterAlpha = 0.25;
 bool forceMode = false;
 bool loadcell_seen_1kg = false;
 
@@ -192,51 +194,59 @@ inline bool limitTriggered(int axisIndex) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// ⚖️ HX711 LOAD CELL FUNCTIES (Bit-banged)
+// ⚖️ HX711 LOAD CELL FUNCTIES (Stabiliteits-update v3.54)
 ////////////////////////////////////////////////////////////////////////////////
 long readScaleRaw() {
-  // Wacht tot DT laag is (data ready)
-  unsigned long timeout = millis();
-  while (PINB & (1 << HX711_DT_BIT)) {
-    if (millis() - timeout > 100) return 0; // Timeout
-  }
+  // Ready-Check: Wacht tot Pin 12 (DT) LOW is
+  if (digitalRead(12) == HIGH) return 0;
 
   uint32_t value = 0;
-  noInterrupts();
+  noInterrupts(); // Alleen kritieke 24-bit uitlezing beschermen
   for (uint8_t i = 0; i < 24; i++) {
-    PORTB |= (1 << HX711_SCK_BIT);
+    digitalWrite(11, HIGH);
     delayMicroseconds(1);
     value = value << 1;
-    if (PINB & (1 << HX711_DT_BIT)) value++;
-    PORTB &= ~(1 << HX711_SCK_BIT);
+    if (digitalRead(12) == HIGH) value++;
+    digitalWrite(11, LOW);
     delayMicroseconds(1);
   }
   // 25e puls (Gain 128)
-  PORTB |= (1 << HX711_SCK_BIT);
+  digitalWrite(11, HIGH);
   delayMicroseconds(1);
-  PORTB &= ~(1 << HX711_SCK_BIT);
+  digitalWrite(11, LOW);
   delayMicroseconds(1);
   interrupts();
 
-  // Sign extension voor 24-bit
   if (value & 0x800000) value |= 0xFF000000;
   return (long)value;
 }
 
 void tareScale() {
   long sum = 0;
-  for (int i = 0; i < 10; i++) {
-    sum += readScaleRaw();
-    delay(10);
+  int count = 0;
+  while(count < 10) {
+    long r = readScaleRaw();
+    if(r != 0) { sum += r; count++; }
+    delay(20);
   }
   loadcell_offset = sum / 10;
+  filteredWeight = 0;
   Serial.println(F("Loadcell: Tare complete."));
 }
 
 float getWeightKg() {
   long raw = readScaleRaw();
-  if (raw == 0) return 0;
-  return (float)(raw - loadcell_offset) / loadcell_divider / 1000.0;
+  if (raw == 0) return (abs(filteredWeight) < 0.05) ? 0 : filteredWeight;
+
+  // Berekening: (offset - raw) / 40000.0
+  float currentWeight = (float)(loadcell_offset - raw) / loadcell_divider;
+
+  // EMA Filter: Alpha 0.25
+  filteredWeight = (filterAlpha * currentWeight) + ((1.0 - filterAlpha) * filteredWeight);
+
+  // Deadband: 0.05 kg
+  if (abs(filteredWeight) < 0.05) return 0;
+  return filteredWeight;
 }
 
 void startMove(long stepsX, long stepsY, long stepsZ, long stepsA, float feed) {
