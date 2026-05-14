@@ -151,7 +151,8 @@ volatile bool limitHitDetected = false;
 
 // HX711 Load Cell
 long loadcell_offset = 0;
-float loadcell_divider = 186.5;
+float loadcell_divider = 40000.0;
+float filteredWeight = 0.0;
 bool forceMode = false;
 bool loadcell_seen_1kg = false;
 
@@ -197,25 +198,27 @@ inline bool limitTriggered(int axisIndex) {
 long readScaleRaw() {
   // Wacht tot DT laag is (data ready)
   unsigned long timeout = millis();
-  while (PINB & (1 << HX711_DT_BIT)) {
+  while (digitalRead(12) == HIGH) {
     if (millis() - timeout > 100) return 0; // Timeout
   }
 
   uint32_t value = 0;
-  noInterrupts();
   for (uint8_t i = 0; i < 24; i++) {
-    PORTB |= (1 << HX711_SCK_BIT);
+    noInterrupts();
+    digitalWrite(11, HIGH);
     delayMicroseconds(1);
     value = value << 1;
-    if (PINB & (1 << HX711_DT_BIT)) value++;
-    PORTB &= ~(1 << HX711_SCK_BIT);
+    if (digitalRead(12) == HIGH) value++;
+    digitalWrite(11, LOW);
+    interrupts();
     delayMicroseconds(1);
   }
+
   // 25e puls (Gain 128)
-  PORTB |= (1 << HX711_SCK_BIT);
+  noInterrupts();
+  digitalWrite(11, HIGH);
   delayMicroseconds(1);
-  PORTB &= ~(1 << HX711_SCK_BIT);
-  delayMicroseconds(1);
+  digitalWrite(11, LOW);
   interrupts();
 
   // Sign extension voor 24-bit
@@ -225,33 +228,40 @@ long readScaleRaw() {
 
 void tareScale() {
   long sum = 0;
-  for (int i = 0; i < 10; i++) {
-    sum += readScaleRaw();
+  int count = 0;
+  int attempts = 0;
+  while (count < 10 && attempts < 100) {
+    long raw = readScaleRaw();
+    if (raw != 0) {
+      sum += raw;
+      count++;
+    }
+    attempts++;
     delay(10);
   }
-  loadcell_offset = sum / 10;
+  if (count > 0) loadcell_offset = sum / count;
+  filteredWeight = 0.0;
   Serial.println(F("Loadcell: Tare complete."));
 }
 
 float getWeightKg() {
-  unsigned long timeout = millis();
-  // We checken handmatig of de DT pin ooit laag wordt
-  bool sensorReady = false;
-  while (millis() - timeout < 100) {
-    if (!(PINB & (1 << HX711_DT_BIT))) {
-      sensorReady = true;
-      break;
-    }
-  }
-
-  if (!sensorReady) {
-    // Als we dit zien, praat de HX711 niet met de Arduino
-    return -99.99; 
+  // Snelle check: is data ready?
+  if (digitalRead(12) == HIGH) {
+    return (fabs(filteredWeight) < 0.05) ? 0.0 : filteredWeight;
   }
 
   long raw = readScaleRaw();
-  if (raw == 0) return 0;
-  return (float)(raw - loadcell_offset) / loadcell_divider / 1000.0;
+  if (raw == 0) return (fabs(filteredWeight) < 0.05) ? 0.0 : filteredWeight;
+
+  // Berekening: (offset - raw) / 40000.0
+  float currentWeight = (float)(loadcell_offset - raw) / loadcell_divider;
+
+  // EMA Filter: alpha = 0.25
+  filteredWeight = (currentWeight * 0.25) + (filteredWeight * 0.75);
+
+  // Deadband check
+  if (fabs(filteredWeight) < 0.05) return 0.0;
+  return filteredWeight;
 }
 
 void startMove(long stepsX, long stepsY, long stepsZ, long stepsA, float feed) {
@@ -524,7 +534,7 @@ void processCommand(char* line) {
           float diff = targetWeight - currentWeight;
           
           // Stability check (50g margin)
-          if (abs(diff) <= 0.05) {
+          if (fabs(diff) <= 0.05) {
             stabilityCount++;
           } else {
             stabilityCount = 0;
