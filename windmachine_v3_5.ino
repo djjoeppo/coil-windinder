@@ -38,9 +38,11 @@
 #define Y_STEP_BIT 6 // PD6
 #define Y_DIR_BIT  7 // PD7
 
-// PORT B: Pins 8, 9
-#define Z_STEP_BIT 0 // PB0
-#define Z_DIR_BIT  1 // PB1
+// PORT B: Pins 8, 9, 11, 12
+#define Z_STEP_BIT 0    // PB0
+#define Z_DIR_BIT  1    // PB1
+#define HX711_SCK_BIT 3 // PB3 (Pin 11)
+#define HX711_DT_BIT  4  // PB4 (Pin 12)
 
 // PORT C: Pins A2, A3, A4, A5 (Limit switches)
 #define A_LIMIT_BIT 2 // PC2
@@ -135,7 +137,7 @@ int serialIdx = 0;
 // 📊 STATUS VARIABELEN
 ////////////////////////////////////////////////////////////////////////////////
 enum MotionState { IDLE, MOVING };
-enum HomeState { HOME_IDLE, HOME_FAST_SEEK, HOME_BACKOFF, HOME_SLOW_SEEK, HOME_DELAY };
+enum HomeState { HOME_IDLE, HOME_FAST_SEEK, HOME_BACKOFF, HOME_SLOW_SEEK, HOME_DELAY, HOME_STABILIZE };
 
 volatile MotionState state = IDLE;
 volatile HomeState homeState = HOME_IDLE;
@@ -146,6 +148,12 @@ volatile int homingAxis = -1;
 
 volatile bool homingSequenceActive = false;
 volatile bool limitHitDetected = false;
+
+// HX711 Load Cell
+long loadcell_offset = 0;
+float loadcell_divider = 186.5;
+bool forceMode = false;
+bool loadcell_seen_1kg = false;
 
 volatile long currentPosition[NUM_AXES] = {0, 0, 0, 0};
 volatile long stepCount[NUM_AXES] = {0, 0, 0, 0};
@@ -181,6 +189,54 @@ inline bool limitTriggeredRaw(int axisIndex) {
 
 inline bool limitTriggered(int axisIndex) {
   return limitTriggeredRaw(axisIndex);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// ⚖️ HX711 LOAD CELL FUNCTIES (Bit-banged)
+////////////////////////////////////////////////////////////////////////////////
+long readScaleRaw() {
+  // Wacht tot DT laag is (data ready)
+  unsigned long timeout = millis();
+  while (PINB & (1 << HX711_DT_BIT)) {
+    if (millis() - timeout > 100) return 0; // Timeout
+  }
+
+  uint32_t value = 0;
+  noInterrupts();
+  for (uint8_t i = 0; i < 24; i++) {
+    PORTB |= (1 << HX711_SCK_BIT);
+    delayMicroseconds(1);
+    value = value << 1;
+    if (PINB & (1 << HX711_DT_BIT)) value++;
+    PORTB &= ~(1 << HX711_SCK_BIT);
+    delayMicroseconds(1);
+  }
+  // 25e puls (Gain 128)
+  PORTB |= (1 << HX711_SCK_BIT);
+  delayMicroseconds(1);
+  PORTB &= ~(1 << HX711_SCK_BIT);
+  delayMicroseconds(1);
+  interrupts();
+
+  // Sign extension voor 24-bit
+  if (value & 0x800000) value |= 0xFF000000;
+  return (long)value;
+}
+
+void tareScale() {
+  long sum = 0;
+  for (int i = 0; i < 10; i++) {
+    sum += readScaleRaw();
+    delay(10);
+  }
+  loadcell_offset = sum / 10;
+  Serial.println(F("Loadcell: Tare complete."));
+}
+
+float getWeightKg() {
+  long raw = readScaleRaw();
+  if (raw == 0) return 0;
+  return (float)(raw - loadcell_offset) / loadcell_divider / 1000.0;
 }
 
 void startMove(long stepsX, long stepsY, long stepsZ, long stepsA, float feed) {
@@ -250,6 +306,7 @@ void startHomingAxis(int axisIndex) {
     Serial.println(F(">>> ALL AXES HOMED SUCCESSFULLY."));
     return;
   }
+
   homingAxis = axisIndex;
   homingStart = millis();
   limitHitDetected = false;
@@ -284,7 +341,17 @@ void handleHoming() {
         long slowSeek = axes[homingAxis].homeDirNegative ? -100000 : 100000;
         startMove((homingAxis == 0 ? slowSeek : 0), (homingAxis == 1 ? slowSeek : 0), (homingAxis == 2 ? slowSeek : 0), (homingAxis == 3 ? slowSeek : 0), homeSlowSpeed);
         Serial.println(F(" -> Sensor vrij, seeking slow..."));
+      } else if (homeState == HOME_STABILIZE) {
+          Serial.println(F(" -> Limit hit, stabilizing load cell (2s)..."));
+          homeDelayStart = millis();
+          homeDelayTime = 2000;
+          homeState = HOME_DELAY;
+          nextHomeState = HOME_IDLE; // Na stabilize komt tare en dan next axis
       } else if (homeState == HOME_IDLE) {
+          if (homingAxis == 2) {
+            tareScale();
+          }
+
           int next = -1;
           if (homingAxis == 2) next = 1;
           else if (homingAxis == 1) next = 0;
@@ -332,7 +399,12 @@ void handleHoming() {
         currentPosition[homingAxis] = 0; 
         homed[homingAxis] = true;
         Serial.print(F("AXIS ")); Serial.print(homingAxis); Serial.println(F(" HOMED OK."));
-        homeDelayStart = millis(); homeDelayTime = 200; homeState = HOME_DELAY; nextHomeState = HOME_IDLE;
+
+        if (homingAxis == 2) {
+          homeState = HOME_STABILIZE;
+        } else {
+          homeDelayStart = millis(); homeDelayTime = 200; homeState = HOME_DELAY; nextHomeState = HOME_IDLE;
+        }
       }
       break;
   }
@@ -381,6 +453,8 @@ void processCommand(char* line) {
   if (strcmp(line, "G28") == 0 || strcmp(line, "HOME") == 0) { startHomingSequence(); return; }
   if (strcmp(line, "G90") == 0) { absoluteMode = true; sendStatusMessage(F("MODUS: ABSOLUUT (G90)"), F("Machine nulpunt.")); Serial.println(F("ok")); return; }
   if (strcmp(line, "G91") == 0) { absoluteMode = false; sendStatusMessage(F("MODUS: RELATIEF (G91)"), F("Huidige locatie.")); Serial.println(F("ok")); return; }
+  if (strcmp(line, "M400") == 0) { forceMode = false; sendStatusMessage(F("MODUS: POSITION (M400)"), F("Z-as mm-commando's.")); Serial.println(F("ok")); return; }
+  if (strcmp(line, "M401") == 0) { forceMode = true; sendStatusMessage(F("MODUS: FORCE (M401)"), F("Z-as kracht-commando's (kg).")); Serial.println(F("ok")); return; }
   if (strcmp(line, "M114") == 0) {
     Serial.println(F("\n--- MACHINE POSITIE ---"));
     char labels[] = {'X', 'Y', 'Z', 'A'};
@@ -393,6 +467,73 @@ void processCommand(char* line) {
   }
  
   if (line[0] == 'G') {
+    // FORCE MODE Z-AS INTERCEPT
+    if (forceMode && (strstr(line, "G1") || strstr(line, "G0")) && strchr(line, 'Z')) {
+      bool zFound;
+      float targetWeight = getAxisValue(line, 'Z', 0, zFound);
+      if (zFound) {
+        Serial.print(F("Force Mode: Seeking ")); Serial.print(targetWeight); Serial.println(F(" kg..."));
+
+        int stabilityCount = 0;
+        bool phase2 = false;
+
+        while (stabilityCount < 20) {
+          float currentWeight = getWeightKg();
+
+          // Phase transition
+          if (!phase2 && currentWeight >= 1.0) {
+            phase2 = true;
+            Serial.println(F(" -> Phase 2: Slow adjustment..."));
+          }
+
+          float diff = targetWeight - currentWeight;
+
+          // Stability check (50g margin)
+          if (abs(diff) <= 0.05) {
+            stabilityCount++;
+          } else {
+            stabilityCount = 0;
+
+            int steps = phase2 ? 5 : 40;
+            bool moveDown = (diff > 0); // Meer gewicht nodig = omlaag (bijv. compressie loadcell)
+
+            // Check Soft Limits
+            long nextPos = currentPosition[2] + (moveDown ? steps : -steps);
+            if (nextPos < 0 || nextPos > (long)(axes[2].maxTravelMM * axes[2].stepsPerMM)) {
+              Serial.println(F("ALARM: Force seek hit soft limit!"));
+              break;
+            }
+
+            // Perform Manual Step
+            if (moveDown) PORTB |= (1 << Z_DIR_BIT); else PORTB &= ~(1 << Z_DIR_BIT); // Dir check required based on invertDir
+            // Eigenlijk moeten we invertDir respecteren:
+            bool dir = moveDown;
+            if (axes[2].invertDir) dir = !dir;
+            if (dir) PORTB |= (1 << Z_DIR_BIT); else PORTB &= ~(1 << Z_DIR_BIT);
+
+            for(int s=0; s<steps; s++) {
+              PORTB |= (1 << Z_STEP_BIT);
+              delayMicroseconds(500);
+              PORTB &= ~(1 << Z_STEP_BIT);
+              delayMicroseconds(500);
+              currentPosition[2] += (moveDown ? 1 : -1);
+            }
+          }
+
+          if (phase2) delay(50);
+
+          // Safety: check overload in loop?
+          if (currentWeight > 30.0) {
+             Serial.println(F("ALARM: EMERGENCY OVERLOAD!"));
+             state = IDLE;
+             break;
+          }
+        }
+        Serial.println(F("ok"));
+        return;
+      }
+    }
+
     for(int i = 0; i < NUM_AXES; i++) { if (!homed[i]) { Serial.println(F("ERROR: Voer eerst G28 uit!")); return; } }
     bool fFound; float feed = getAxisValue(line, 'F', targetSpeed, fFound);
     long stepsToMove[NUM_AXES] = {0, 0, 0, 0}; bool axisIncluded[NUM_AXES] = {false, false, false, false};
@@ -459,11 +600,29 @@ void setup() {
   Serial.begin(115200);
   setupConfig();
   for (int i = 0; i < NUM_AXES; i++) { pinMode(axes[i].stepPin, OUTPUT); pinMode(axes[i].dirPin, OUTPUT); pinMode(axes[i].limitPin, INPUT_PULLUP); }
+
+  // HX711 Setup
+  pinMode(11, OUTPUT); // SCK
+  pinMode(12, INPUT);  // DT
+  digitalWrite(11, LOW);
+
   cli(); TCCR1A = 0; TCCR1B = 0; OCR1A = 2000; TCCR1B |= (1 << WGM12); TCCR1B |= (1 << CS11); TIMSK1 |= (1 << OCIE1A); sei();
   Serial.println(F("--- READY ---"));
 }
 
 void loop() {
+  // SAFETY OVERLOAD PROTECTION
+  if (homed[2]) {
+    float weight = getWeightKg();
+    if (!loadcell_seen_1kg && weight > 1.0) {
+      loadcell_seen_1kg = true;
+    }
+    if (loadcell_seen_1kg && weight > 30.0) {
+      state = IDLE;
+      Serial.println(F("ALARM: OVERLOAD PROTECT TRIGGERED (>30kg)!"));
+    }
+  }
+
   while (Serial.available() > 0) {
     char c = Serial.read();
     if (c == '\n') { serialBuffer[serialIdx] = '\0'; processCommand(serialBuffer); serialIdx = 0; }
