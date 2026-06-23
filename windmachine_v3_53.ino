@@ -458,7 +458,7 @@ void handleHoming() {
     return;
   }
 
-  // 2. DELAY AFHANDELING (Wachttijden tussen stappen)
+  // 2. DELAY HANDLING (Wait times between steps)
   if (homeState == HOME_DELAY) {
     if (millis() - homeDelayStart >= homeDelayTime) {
       homeState = nextHomeState;
@@ -473,16 +473,16 @@ void handleHoming() {
         limitHitDetected = false;
         long slowSeek = axes[homingAxis].homeDirNegative ? -100000 : 100000;
         startMove((homingAxis == 0 ? slowSeek : 0), (homingAxis == 1 ? slowSeek : 0), (homingAxis == 2 ? slowSeek : 0), (homingAxis == 3 ? slowSeek : 0), homeSlowSpeed);
-        Serial.println(F(" -> Sensor vrij, seeking slow..."));
+        Serial.println(F(" -> Sensor clear, seeking slow..."));
       } 
       else if (homeState == HOME_IDLE) { 
-          // Dit wordt uitgevoerd NADAT de 2 seconden stabilisatie (of 200ms as-pauze) klaar is
+          // This is executed AFTER the 2 second stabilization (or 200ms axis-pause) is finished
           if (homingAxis == 2) {
             tareScale();
             Serial.println(F(" -> HX711 gecalibreerd."));
           }
           
-          // Bepaal de volgende as
+          // Determine the next axis
           int next = -1;
           if (homingAxis == 2) next = 1;      // Z -> Y
           else if (homingAxis == 1) next = 0; // Y -> X
@@ -499,7 +499,7 @@ void handleHoming() {
     return;
   }
 
-  // 3. DETECTIE VAN LIMIT SWITCH
+  // 3. LIMIT SWITCH DETECTION
   bool hit = limitHitDetected || limitTriggered(homingAxis);
 
   switch (homeState) {
@@ -526,15 +526,15 @@ void handleHoming() {
         homed[homingAxis] = true;
         Serial.print(F("AXIS ")); Serial.print(homingAxis); Serial.println(F(" HOMED OK."));
         
-        // SPECIAL: Als Z-as klaar is, start stabilisatie timer
+        // SPECIAL: If Z-axis is finished, start stabilization timer
         if (homingAxis == 2) {
-          Serial.println(F(" -> Z-as: Wacht 2 seconden voor stabilisatie..."));
+          Serial.println(F(" -> Z-axis: Wait 2 seconds for stabilization..."));
           homeDelayStart = millis(); 
           homeDelayTime = 2000; 
           homeState = HOME_DELAY; 
           nextHomeState = HOME_IDLE;
         } else {
-          // Voor andere assen gewoon een korte pauze
+          // For other axes just a short pause
           homeDelayStart = millis(); homeDelayTime = 200; homeState = HOME_DELAY; nextHomeState = HOME_IDLE; 
         }
       }
@@ -789,14 +789,16 @@ void processCommand(char* line) {
         Serial.println(F("ok"));
       } else {
         int nextHead = (head + 1) % BUFFER_SIZE;
-        if (nextHead != tail) {
-          for (int i = 0; i < NUM_AXES; i++) { moveBuffer[head].steps[i] = stepsToMove[i]; }
-          moveBuffer[head].feed = feed;
-          head = nextHead;
-          Serial.println(F("ok"));
-        } else {
-          Serial.println(F("ERROR: Buffer vol!"));
+        // Wait for buffer space with safety updates
+        while (nextHead == tail) {
+          wdt_reset();
+          updateLoadcell();
         }
+
+        for (int i = 0; i < NUM_AXES; i++) { moveBuffer[head].steps[i] = stepsToMove[i]; }
+        moveBuffer[head].feed = feed;
+        head = nextHead;
+        Serial.println(F("ok"));
       }
     } else { Serial.println(F("ok")); }
   }
@@ -855,7 +857,7 @@ void setup() {
   pinMode(12, INPUT);  // DT
   digitalWrite(11, LOW);
 
-  // Timer1 initialisatie voor stappenmotoren
+  // Timer1 initialization for stepper motors
   cli(); 
   TCCR1A = 0; TCCR1B = 0; OCR1A = 2000; 
   TCCR1B |= (1 << WGM12); TCCR1B |= (1 << CS11); TIMSK1 |= (1 << OCIE1A); 
@@ -869,7 +871,7 @@ void setup() {
 }
 void loop() {
   wdt_reset();
-  // 1. CRUCIAAL: Update de loadcell continu op de achtergrond (Non-blocking)
+  // 1. CRITICAL: Continually update loadcell in background (Non-blocking)
   updateLoadcell();
 
   // 1a. Tension Quality Tracking (M404 stats)
@@ -912,7 +914,7 @@ void loop() {
 
   // 2. SAFETY OVERLOAD PROTECTION
   if (homed[2]) {
-    // getWeightKg() geeft nu direct de actuele waarde uit de achtergrond-uitlezing
+    // getWeightKg() now returns the actual value from background reading
     float weight = getWeightKg(); 
     
     if (!loadcell_seen_1kg && weight > 1.0) {
@@ -920,8 +922,12 @@ void loop() {
     }
     if (loadcell_seen_1kg && weight > 30.0) {
       // EMERGENCY OVERLOAD RETRACT
-      state = IDLE;
-      head = 0; tail = 0; // Flush move buffer
+      cli();
+      tail = head; // Flush motion buffer
+      state = IDLE; // Halt Timer1 movement
+      dominantStepsRemaining = 0;
+      sei();
+
       isLocked = true;
 
       Serial.println(F("ALARM: EMERGENCY OVERLOAD! RETRACTING Z..."));
@@ -947,11 +953,7 @@ void loop() {
   }
 
   // 3. SERIAL COMMANDS HANDLING
-  // Stricter buffer control: only read if space available in ring buffer
   while (Serial.available() > 0) {
-    int nextHead = (head + 1) % BUFFER_SIZE;
-    if (nextHead == tail) break;
-
     char c = Serial.read();
     if (c == '\n') { 
       serialBuffer[serialIdx] = '\0'; 
