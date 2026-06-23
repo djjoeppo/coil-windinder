@@ -192,67 +192,157 @@ inline bool limitTriggered(int axisIndex) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// ⚖️ HX711 LOAD CELL FUNCTIES (Bit-banged)
+// ⚖️ HX711 LOAD CELL CONFIGURATIE & FUNCTIES (OPTIMIZED VERSION)
 ////////////////////////////////////////////////////////////////////////////////
+
+// HX711 pins via direct port manipulation
+#define HX711_SCK_HIGH() PORTB |=  (1 << HX711_SCK_BIT)
+#define HX711_SCK_LOW()  PORTB &= ~(1 << HX711_SCK_BIT)
+#define HX711_DT_READ()  (PINB & (1 << HX711_DT_BIT))
+
+volatile float filteredWeight = 0.0;
+volatile bool hx711Online = false;
+
+unsigned long lastHXRead = 0;
+
 long readScaleRaw() {
-  // Wacht tot DT laag is (data ready)
+
+  // Timeout protection
   unsigned long timeout = millis();
-  while (PINB & (1 << HX711_DT_BIT)) {
-    if (millis() - timeout > 100) return 0; // Timeout
+
+  while (HX711_DT_READ()) {
+    if (millis() - timeout > 100) {
+      hx711Online = false;
+      return 0;
+    }
   }
 
   uint32_t value = 0;
-  noInterrupts();
+
+  // Interrupts alleen uit tijdens clock pulse
   for (uint8_t i = 0; i < 24; i++) {
-    PORTB |= (1 << HX711_SCK_BIT);
+
+    noInterrupts();
+
+    HX711_SCK_HIGH();
     delayMicroseconds(1);
-    value = value << 1;
-    if (PINB & (1 << HX711_DT_BIT)) value++;
-    PORTB &= ~(1 << HX711_SCK_BIT);
+
+    value <<= 1;
+
+    if (HX711_DT_READ()) {
+      value++;
+    }
+
+    HX711_SCK_LOW();
+
+    interrupts();
+
     delayMicroseconds(1);
   }
-  // 25e puls (Gain 128)
-  PORTB |= (1 << HX711_SCK_BIT);
+
+  // Gain pulse (128 gain kanaal A)
+  noInterrupts();
+
+  HX711_SCK_HIGH();
   delayMicroseconds(1);
-  PORTB &= ~(1 << HX711_SCK_BIT);
-  delayMicroseconds(1);
+
+  HX711_SCK_LOW();
+
   interrupts();
 
-  // Sign extension voor 24-bit
-  if (value & 0x800000) value |= 0xFF000000;
+  // Sign extend
+  if (value & 0x800000) {
+    value |= 0xFF000000;
+  }
+
+  hx711Online = true;
+  lastHXRead = millis();
+
   return (long)value;
 }
 
 void tareScale() {
+
   long sum = 0;
-  for (int i = 0; i < 10; i++) {
-    sum += readScaleRaw();
+  int validReads = 0;
+
+  for (int i = 0; i < 15; i++) {
+
+    long raw = readScaleRaw();
+
+    if (raw != 0) {
+      sum += raw;
+      validReads++;
+    }
+
     delay(10);
   }
-  loadcell_offset = sum / 10;
+
+  if (validReads > 0) {
+    loadcell_offset = sum / validReads;
+  }
+
+  filteredWeight = 0.0;
+
   Serial.println(F("Loadcell: Tare complete."));
 }
 
-float getWeightKg() {
-  unsigned long timeout = millis();
-  // We checken handmatig of de DT pin ooit laag wordt
-  bool sensorReady = false;
-  while (millis() - timeout < 100) {
-    if (!(PINB & (1 << HX711_DT_BIT))) {
-      sensorReady = true;
-      break;
-    }
-  }
+void updateLoadcell() {
+  // Voeg een timer toe zodat we de processor niet overbelasten
+  static unsigned long lastUpdateCell = 0;
+  if (millis() - lastUpdateCell < 50) return; // Wacht 50ms tussen de metingen
 
-  if (!sensorReady) {
-    // Als we dit zien, praat de HX711 niet met de Arduino
-    return -99.99; 
-  }
+  // Geen data ready op de fysieke pin? 
+  //Direct stoppen en terug naar motoren!
+  if (HX711_DT_READ()) return; 
 
   long raw = readScaleRaw();
-  if (raw == 0) return 0;
-  return (float)(raw - loadcell_offset) / loadcell_divider / 1000.0;
+
+  // Timeout / sensor error / opstartwaarde negeren
+  if (raw == 0 || raw == -8388608) return;
+
+  // Gewicht berekenen (Formule uit jouw succesvolle test)
+  float currentWeight = (float)(loadcell_offset - raw) / loadcell_divider;
+
+  // Ruwe spike rejecter tegen flikkerende waardes
+  static float previousWeight = 0;
+  if (fabs(currentWeight - previousWeight) > 15.0) {
+    previousWeight = currentWeight;
+    return;
+  }
+  previousWeight = currentWeight;
+
+  // EMA low pass filter voor een stabiel gewicht op de achtergrond
+  filteredWeight = (currentWeight * 0.25f) + (filteredWeight * 0.75f);
+  
+  // Update de klok voor de volgende meting over 50ms
+  lastUpdateCell = millis();
 }
+float getWeightKg() {
+
+  // Sensor offline detectie
+  if (millis() - lastHXRead > 500) {
+    hx711Online = false;
+    return 0.0;
+  }
+
+  float weight;
+
+  noInterrupts();
+  weight = filteredWeight;
+  interrupts();
+
+  // Deadband
+  if (fabs(weight) < 0.03f) {
+    return 0.0;
+  }
+
+  return weight;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// 🚀 MOTOR START FUNCTIE
+////////////////////////////////////////////////////////////////////////////////
 
 void startMove(long stepsX, long stepsY, long stepsZ, long stepsA, float feed) {
   long steps[NUM_AXES] = {stepsX, stepsY, stepsZ, stepsA};
@@ -513,6 +603,7 @@ void processCommand(char* line) {
         bool phase2 = false;
 
         while (stabilityCount < 20) {
+          updateLoadcell();
           float currentWeight = getWeightKg();
           
           // Phase transition
@@ -634,21 +725,38 @@ ISR(TIMER1_COMPA_vect) {
 void setup() {
   Serial.begin(115200);
   setupConfig();
-  for (int i = 0; i < NUM_AXES; i++) { pinMode(axes[i].stepPin, OUTPUT); pinMode(axes[i].dirPin, OUTPUT); pinMode(axes[i].limitPin, INPUT_PULLUP); }
+  for (int i = 0; i < NUM_AXES; i++) { 
+    pinMode(axes[i].stepPin, OUTPUT); 
+    pinMode(axes[i].dirPin, OUTPUT); 
+    pinMode(axes[i].limitPin, INPUT_PULLUP); 
+  }
   
-  // HX711 Setup
+  // HX711 Hardware Setup Pins
   pinMode(11, OUTPUT); // SCK
   pinMode(12, INPUT);  // DT
   digitalWrite(11, LOW);
 
-  cli(); TCCR1A = 0; TCCR1B = 0; OCR1A = 2000; TCCR1B |= (1 << WGM12); TCCR1B |= (1 << CS11); TIMSK1 |= (1 << OCIE1A); sei();
+  // Timer1 initialisatie voor stappenmotoren
+  cli(); 
+  TCCR1A = 0; TCCR1B = 0; OCR1A = 2000; 
+  TCCR1B |= (1 << WGM12); TCCR1B |= (1 << CS11); TIMSK1 |= (1 << OCIE1A); 
+  sei();
+  
+  // ⚖️ VOEG DIT TOE: Direct taren bij het opstarten van de machine
+  delay(500); // Geef de sensor even kort de tijd om op te starten
+  tareScale(); 
+  
   Serial.println(F("--- READY ---"));
 }
-
 void loop() {
-  // SAFETY OVERLOAD PROTECTION
+  // 1. CRUCIAAL: Update de loadcell continu op de achtergrond (Non-blocking)
+  updateLoadcell();
+
+  // 2. SAFETY OVERLOAD PROTECTION
   if (homed[2]) {
-    float weight = getWeightKg();
+    // getWeightKg() geeft nu direct de actuele waarde uit de achtergrond-uitlezing
+    float weight = getWeightKg(); 
+    
     if (!loadcell_seen_1kg && weight > 1.0) {
       loadcell_seen_1kg = true;
     }
@@ -658,14 +766,26 @@ void loop() {
     }
   }
 
+  // 3. SERIAL COMMANDS HANDLING
   while (Serial.available() > 0) {
     char c = Serial.read();
-    if (c == '\n') { serialBuffer[serialIdx] = '\0'; processCommand(serialBuffer); serialIdx = 0; }
-    else if (c != '\r' && serialIdx < sizeof(serialBuffer) - 1) { serialBuffer[serialIdx++] = c; }
+    if (c == '\n') { 
+      serialBuffer[serialIdx] = '\0'; 
+      processCommand(serialBuffer); 
+      serialIdx = 0; 
+    }
+    else if (c != '\r' && serialIdx < sizeof(serialBuffer) - 1) { 
+      serialBuffer[serialIdx++] = c; 
+    }
   }
+
+  // 4. MOTOR EN MOVEMENT COMMANDS
   if (state == IDLE && head != tail && homeState == HOME_IDLE) {
     startMove(moveBuffer[tail].steps[0], moveBuffer[tail].steps[1], moveBuffer[tail].steps[2], moveBuffer[tail].steps[3], moveBuffer[tail].feed);
     tail = (tail + 1) % BUFFER_SIZE;
   }
-  updateRamp(); handleHoming(); 
+  
+  // 5. REALTIE-TIME UP-KEEP
+  updateRamp(); 
+  handleHoming(); 
 }
