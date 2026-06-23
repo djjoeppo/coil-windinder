@@ -193,15 +193,18 @@ unsigned long homingStart = 0;
 ////////////////////////////////////////////////////////////////////////////////
 inline bool limitTriggeredRaw(int axisIndex) {
   if (axisIndex < 0 || axisIndex >= NUM_AXES) return false;
-  bool raw = false;
+  bool isLow = false;
   uint8_t pinVal = PINC; 
   switch(axisIndex) {
-    case 0: raw = !(pinVal & (1 << X_LIMIT_BIT)); break;
-    case 1: raw = !(pinVal & (1 << Y_LIMIT_BIT)); break;
-    case 2: raw = !(pinVal & (1 << Z_LIMIT_BIT)); break;
-    case 3: raw = !(pinVal & (1 << A_LIMIT_BIT)); break;
+    case 0: isLow = !(pinVal & (1 << X_LIMIT_BIT)); break;
+    case 1: isLow = !(pinVal & (1 << Y_LIMIT_BIT)); break;
+    case 2: isLow = !(pinVal & (1 << Z_LIMIT_BIT)); break;
+    case 3: isLow = !(pinVal & (1 << A_LIMIT_BIT)); break;
   }
-  return axes[axisIndex].isNC ? raw : !raw;
+  // With INPUT_PULLUP:
+  // NO (isNC=false): triggered when pin is LOW (isLow=true)
+  // NC (isNC=true): triggered when pin is HIGH (isLow=false)
+  return axes[axisIndex].isNC ? !isLow : isLow;
 }
 
 inline bool limitTriggered(int axisIndex) {
@@ -380,10 +383,10 @@ void startMove(long stepsX, long stepsY, long stepsZ, long stepsA, float feed) {
     if (steps[i] != 0) {
       bool dir = (steps[i] > 0);
       if (axes[i].invertDir) dir = !dir;
-      if (i == 0) { if (dir) PORTD |= (1 << X_DIR_BIT); else PORTD &= ~(1 << X_DIR_BIT); }
-      else if (i == 1) { if (dir) PORTD |= (1 << Y_DIR_BIT); else PORTD &= ~(1 << Y_DIR_BIT); }
-      else if (i == 2) { if (dir) PORTB |= (1 << Z_DIR_BIT); else PORTB &= ~(1 << Z_DIR_BIT); }
-      else if (i == 3) { if (dir) PORTD |= (1 << A_DIR_BIT); else PORTD &= ~(1 << A_DIR_BIT); }
+      if (i == 0) { noInterrupts(); if (dir) PORTD |= (1 << X_DIR_BIT); else PORTD &= ~(1 << X_DIR_BIT); interrupts(); }
+      else if (i == 1) { noInterrupts(); if (dir) PORTD |= (1 << Y_DIR_BIT); else PORTD &= ~(1 << Y_DIR_BIT); interrupts(); }
+      else if (i == 2) { noInterrupts(); if (dir) PORTB |= (1 << Z_DIR_BIT); else PORTB &= ~(1 << Z_DIR_BIT); interrupts(); }
+      else if (i == 3) { noInterrupts(); if (dir) PORTD |= (1 << A_DIR_BIT); else PORTD &= ~(1 << A_DIR_BIT); interrupts(); }
       moveDir[i] = (steps[i] > 0) ? 1 : -1;
       if (i == 3) totalASteps += labs(steps[3]);
     }
@@ -522,7 +525,9 @@ void handleHoming() {
       if (hit) {
         state = IDLE;
         limitHitDetected = false;
+        noInterrupts();
         currentPosition[homingAxis] = 0; 
+        interrupts();
         homed[homingAxis] = true;
         Serial.print(F("AXIS ")); Serial.print(homingAxis); Serial.println(F(" HOMED OK."));
         
@@ -554,7 +559,7 @@ void updateRamp() {
   else if (currentSpeed > targetSpeed) { currentSpeed -= accel * dt; if (currentSpeed < targetSpeed) currentSpeed = targetSpeed; }
   float safeSpeed = max(currentSpeed, 10.0);
   long ocrVal = (2000000.0 / safeSpeed);
-  if (ocrVal < 100) ocrVal = 100;
+  if (ocrVal < 60) ocrVal = 60; // Allow up to ~33.3kHz
   OCR1A = ocrVal;
 }
 
@@ -689,6 +694,12 @@ void processCommand(char* line) {
       bool zFound;
       float targetWeight = getAxisValue(line, 'Z', 0, zFound);
       if (zFound) {
+        // Wait for coordinated moves to finish before starting force seek
+        while (head != tail) {
+          wdt_reset();
+          updateLoadcell();
+        }
+
         Serial.print(F("Force Mode: Seeking ")); Serial.print(targetWeight); Serial.println(F(" kg..."));
         
         int stabilityCount = 0;
@@ -723,26 +734,32 @@ void processCommand(char* line) {
               break;
             }
 
-            // Perform Manual Step respecting invertDir
+            // Perform Manual Step respecting invertDir with interrupt safety
             bool dir = moveDown;
             if (axes[2].invertDir) dir = !dir;
+
+            noInterrupts();
             if (dir) PORTB |= (1 << Z_DIR_BIT); else PORTB &= ~(1 << Z_DIR_BIT);
+            interrupts();
 
             for(int s=0; s<steps; s++) {
+              noInterrupts();
               PORTB |= (1 << Z_STEP_BIT);
-              delayMicroseconds(500);
+              delayMicroseconds(5); // Min pulse
               PORTB &= ~(1 << Z_STEP_BIT);
-              delayMicroseconds(500);
               currentPosition[2] += (moveDown ? 1 : -1);
+              interrupts();
+              delayMicroseconds(1000); // Step period
             }
           }
 
           if (phase2) delay(50);
           
-          // Safety overload check
+          // Safety overload check - trigger full retract and lock
           if (currentWeight > 30.0) {
-             Serial.println(F("ALARM: EMERGENCY OVERLOAD!"));
-             state = IDLE;
+             // This will be handled by the main loop protection if we break,
+             // but we trigger it here for immediate effect.
+             loadcell_seen_1kg = true; // Force trigger
              break;
           }
         }
@@ -768,7 +785,10 @@ void processCommand(char* line) {
     for (int i = 0; i < NUM_AXES; i++) {
       float val = getAxisValue(line, axisChars[i], 0.0, axisIncluded[i]);
       if (axisIncluded[i]) {
-        float currentPosUnit = (float)currentPosition[i] / axes[i].stepsPerMM;
+        noInterrupts();
+        long pos = currentPosition[i];
+        interrupts();
+        float currentPosUnit = (float)pos / axes[i].stepsPerMM;
         for (int b = tail; b != head; b = (b + 1) % BUFFER_SIZE) { currentPosUnit += (moveBuffer[b].steps[i] / axes[i].stepsPerMM); }
         float deltaUnit = absoluteMode ? (val - currentPosUnit) : val;
         float newPosUnit = currentPosUnit + deltaUnit;
@@ -886,7 +906,7 @@ void loop() {
   }
 
   // 1b. Background Tension Lock (M403)
-  if (tensionLockActive) {
+  if (tensionLockActive && !isLocked) {
     static unsigned long lastLockStep = 0;
     if (millis() - lastLockStep > 50) {
       float currentW = getWeightKg();
@@ -941,11 +961,13 @@ void loop() {
       int steps = round(5.0 * axes[2].stepsPerMM);
       for(int s=0; s<steps; s++) {
         wdt_reset();
+        noInterrupts();
         PORTB |= (1 << Z_STEP_BIT);
-        delayMicroseconds(400);
+        delayMicroseconds(5); // Min pulse
         PORTB &= ~(1 << Z_STEP_BIT);
-        delayMicroseconds(400);
         currentPosition[2]--;
+        interrupts();
+        delayMicroseconds(800); // Retract period
       }
 
       Serial.println(F("Machine LOCKED. Material safety engaged."));
