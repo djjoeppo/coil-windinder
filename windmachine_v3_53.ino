@@ -2,6 +2,8 @@
 // 🧠 CNC 4-AXIS FIRMWARE (VERSION 2.2 - OPTIMIZED)
 ////////////////////////////////////////////////////////////////////////////////
 
+#include <avr/wdt.h>
+
 #define NUM_AXES 4
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -168,6 +170,21 @@ volatile bool homed[NUM_AXES] = {false, false, false, false};
 volatile float currentSpeed = 0;
 bool absoluteMode = true;
 
+bool debugMode = false;
+bool isLocked = false;
+float lastG1Feedrate = 3000.0;
+
+// Tension Lock (M403)
+float targetTension = 0.0;
+bool tensionLockActive = false;
+
+// Quality Control (M404)
+float maxTension = 0.0;
+float minTension = 999.0;
+double totalTensionSum = 0.0;
+unsigned long tensionSampleCount = 0;
+long totalASteps = 0;
+
 unsigned long lastRampMicros = 0;
 unsigned long homingStart = 0;
 
@@ -288,23 +305,23 @@ void tareScale() {
 }
 
 void updateLoadcell() {
-  // Voeg een timer toe zodat we de processor niet overbelasten
+  // Timer to avoid over-tasking the processor
   static unsigned long lastUpdateCell = 0;
-  if (millis() - lastUpdateCell < 50) return; // Wacht 50ms tussen de metingen
+  if (millis() - lastUpdateCell < 50) return; // Wait 50ms between readings
 
-  // Geen data ready op de fysieke pin? 
-  //Direct stoppen en terug naar motoren!
+  // No data ready on the physical pin?
+  // Stop immediately and return to motor control!
   if (HX711_DT_READ()) return; 
 
   long raw = readScaleRaw();
 
-  // Timeout / sensor error / opstartwaarde negeren
+  // Ignore timeout / sensor error / startup values
   if (raw == 0 || raw == -8388608) return;
 
-  // Gewicht berekenen (Formule uit jouw succesvolle test)
+  // Calculate weight based on calibrated divider
   float currentWeight = (float)(loadcell_offset - raw) / loadcell_divider;
 
-  // Ruwe spike rejecter tegen flikkerende waardes
+  // Raw spike rejecter for unstable values
   static float previousWeight = 0;
   if (fabs(currentWeight - previousWeight) > 15.0) {
     previousWeight = currentWeight;
@@ -312,10 +329,10 @@ void updateLoadcell() {
   }
   previousWeight = currentWeight;
 
-  // EMA low pass filter voor een stabiel gewicht op de achtergrond
+  // EMA low pass filter for background stability
   filteredWeight = (currentWeight * 0.25f) + (filteredWeight * 0.75f);
   
-  // Update de klok voor de volgende meting over 50ms
+  // Update timer for next measurement
   lastUpdateCell = millis();
 }
 float getWeightKg() {
@@ -368,6 +385,7 @@ void startMove(long stepsX, long stepsY, long stepsZ, long stepsA, float feed) {
       else if (i == 2) { if (dir) PORTB |= (1 << Z_DIR_BIT); else PORTB &= ~(1 << Z_DIR_BIT); }
       else if (i == 3) { if (dir) PORTD |= (1 << A_DIR_BIT); else PORTD &= ~(1 << A_DIR_BIT); }
       moveDir[i] = (steps[i] > 0) ? 1 : -1;
+      if (i == 3) totalASteps += labs(steps[3]);
     }
   }
 
@@ -564,11 +582,68 @@ void processCommand(char* line) {
   while(*p) { if(*p >= 'a' && *p <= 'z') *p -= 32; p++; }
   if (len == 0) return;
 
-  if (strcmp(line, "G28") == 0 || strcmp(line, "HOME") == 0) { startHomingSequence(); return; }
+  if (isLocked) {
+    if (strcmp(line, "M999") == 0) {
+      isLocked = false;
+      Serial.println(F("ALARM cleared. Machine unlocked."));
+      Serial.println(F("ok"));
+    } else {
+      Serial.println(F("ALARM: Machine Locked! Use M999 to clear."));
+    }
+    return;
+  }
+
+  if (strcmp(line, "G28") == 0 || strcmp(line, "HOME") == 0) { startHomingSequence(); Serial.println(F("ok")); return; }
   if (strcmp(line, "G90") == 0) { absoluteMode = true; sendStatusMessage(F("MODUS: ABSOLUUT (G90)"), F("Machine nulpunt.")); Serial.println(F("ok")); return; }
   if (strcmp(line, "G91") == 0) { absoluteMode = false; sendStatusMessage(F("MODUS: RELATIEF (G91)"), F("Huidige locatie.")); Serial.println(F("ok")); return; }
   if (strcmp(line, "M400") == 0) { forceMode = false; sendStatusMessage(F("MODUS: POSITION (M400)"), F("Z-as mm-commando's.")); Serial.println(F("ok")); return; }
   if (strcmp(line, "M401") == 0) { forceMode = true; sendStatusMessage(F("MODUS: FORCE (M401)"), F("Z-as kracht-commando's (kg).")); Serial.println(F("ok")); return; }
+  if (strcmp(line, "M402") == 0) { tareScale(); Serial.println(F("ok")); return; }
+
+  if (strstr(line, "M111")) {
+    bool sFound;
+    float sVal = getAxisValue(line, 'S', 0, sFound);
+    if (sFound) {
+      debugMode = (sVal > 0);
+      Serial.print(F("Debug Mode: ")); Serial.println(debugMode ? F("ON") : F("OFF"));
+      Serial.println(F("ok"));
+      return;
+    }
+  }
+
+  if (strcmp(line, "M404") == 0) {
+    Serial.println(F("--- COIL QUALITY REPORT ---"));
+    Serial.print(F("Tension Max: ")); Serial.print(maxTension * 1000.0); Serial.println(F(" g"));
+    Serial.print(F("Tension Min: ")); Serial.print((minTension > 900.0 ? 0.0 : minTension) * 1000.0); Serial.println(F(" g"));
+    float avg = (tensionSampleCount > 0) ? (totalTensionSum / (float)tensionSampleCount) : 0.0;
+    Serial.print(F("Average Tension: ")); Serial.print(avg * 1000.0); Serial.println(F(" g"));
+    float rotations = (float)totalASteps / axes[3].stepsPerMM / 360.0;
+    Serial.print(F("Total Rotations: ")); Serial.println(rotations, 2);
+    Serial.println(F("---------------------------"));
+
+    // Reset stats after report
+    maxTension = 0.0; minTension = 999.0; totalTensionSum = 0.0; tensionSampleCount = 0; totalASteps = 0;
+
+    Serial.println(F("ok"));
+    return;
+  }
+
+  if (strstr(line, "M403")) {
+    bool sFound;
+    float sVal = getAxisValue(line, 'S', 0, sFound);
+    if (sFound) {
+      if (sVal <= 0) {
+        tensionLockActive = false;
+        Serial.println(F("Tension Lock: DISABLED"));
+      } else {
+        targetTension = sVal;
+        tensionLockActive = true;
+        Serial.print(F("Tension Lock: ENABLED (Target: ")); Serial.print(targetTension); Serial.println(F(" kg)"));
+      }
+      Serial.println(F("ok"));
+      return;
+    }
+  }
   if (strcmp(line, "M114") == 0) {
     Serial.println(F("\n--- MACHINE STATUS ---"));
     char labels[] = {'X', 'Y', 'Z', 'A'};
@@ -590,6 +665,23 @@ void processCommand(char* line) {
     Serial.println(F("ok")); 
     return;
   }
+
+  if (strcmp(line, "M119") == 0) {
+    Serial.println(F("--- ENDSTOP STATUS ---"));
+    char labels[] = {'X', 'Y', 'Z', 'A'};
+    for (int i = 0; i < NUM_AXES; i++) {
+      Serial.print(labels[i]);
+      Serial.print(F(": "));
+      if (limitTriggered(i)) {
+        Serial.println(F("TRIGGERED"));
+      } else {
+        Serial.println(F("open"));
+      }
+    }
+    Serial.println(F("----------------------"));
+    Serial.println(F("ok"));
+    return;
+  }
  
   if (line[0] == 'G') {
     // FORCE MODE Z-AS INTERCEPT
@@ -603,6 +695,7 @@ void processCommand(char* line) {
         bool phase2 = false;
 
         while (stabilityCount < 20) {
+          wdt_reset(); // Pet the watchdog in long-running loop
           updateLoadcell();
           float currentWeight = getWeightKg();
           
@@ -615,13 +708,13 @@ void processCommand(char* line) {
           float diff = targetWeight - currentWeight;
           
           // Stability check (50g margin)
-          if (abs(diff) <= 0.05) {
+          if (fabs(diff) <= 0.05) {
             stabilityCount++;
           } else {
             stabilityCount = 0;
             
             int steps = phase2 ? 5 : 40;
-            bool moveDown = (diff > 0); // Meer gewicht nodig = omlaag (bijv. compressie loadcell)
+            bool moveDown = (diff > 0); // Need more weight = move down
             
             // Check Soft Limits
             long nextPos = currentPosition[2] + (moveDown ? steps : -steps);
@@ -630,9 +723,7 @@ void processCommand(char* line) {
               break;
             }
 
-            // Perform Manual Step
-            if (moveDown) PORTB |= (1 << Z_DIR_BIT); else PORTB &= ~(1 << Z_DIR_BIT); // Dir check required based on invertDir
-            // Eigenlijk moeten we invertDir respecteren:
+            // Perform Manual Step respecting invertDir
             bool dir = moveDown;
             if (axes[2].invertDir) dir = !dir;
             if (dir) PORTB |= (1 << Z_DIR_BIT); else PORTB &= ~(1 << Z_DIR_BIT);
@@ -648,7 +739,7 @@ void processCommand(char* line) {
 
           if (phase2) delay(50);
           
-          // Safety: check overload in loop?
+          // Safety overload check
           if (currentWeight > 30.0) {
              Serial.println(F("ALARM: EMERGENCY OVERLOAD!"));
              state = IDLE;
@@ -661,7 +752,17 @@ void processCommand(char* line) {
     }
 
     for(int i = 0; i < NUM_AXES; i++) { if (!homed[i]) { Serial.println(F("ERROR: Voer eerst G28 uit!")); return; } }
-    bool fFound; float feed = getAxisValue(line, 'F', targetSpeed, fFound);
+
+    bool isG0 = strstr(line, "G0") != NULL;
+    float feed;
+    if (isG0) {
+      feed = maxSpeed;
+    } else {
+      bool fFound;
+      feed = getAxisValue(line, 'F', lastG1Feedrate, fFound);
+      if (fFound) lastG1Feedrate = feed;
+    }
+
     long stepsToMove[NUM_AXES] = {0, 0, 0, 0}; bool axisIncluded[NUM_AXES] = {false, false, false, false};
     char axisChars[NUM_AXES] = {'X', 'Y', 'Z', 'A'}; bool hasMovement = false;
     for (int i = 0; i < NUM_AXES; i++) {
@@ -677,9 +778,26 @@ void processCommand(char* line) {
       }
     }
     if (hasMovement) {
-      int nextHead = (head + 1) % BUFFER_SIZE;
-      if (nextHead != tail) { for (int i = 0; i < NUM_AXES; i++) { moveBuffer[head].steps[i] = stepsToMove[i]; } moveBuffer[head].feed = feed; head = nextHead; Serial.println(F("ok")); }
-      else { Serial.println(F("ERROR: Buffer vol!")); }
+      if (debugMode) {
+        Serial.println(F("--- DEBUG MOVE ---"));
+        for (int i = 0; i < NUM_AXES; i++) {
+          Serial.print(axisChars[i]); Serial.print(F(" Steps: ")); Serial.print(stepsToMove[i]);
+          Serial.print(F(" Dir: ")); Serial.println(stepsToMove[i] >= 0 ? F("POS") : F("NEG"));
+        }
+        Serial.print(F("Feed: ")); Serial.println(feed);
+        Serial.println(F("------------------"));
+        Serial.println(F("ok"));
+      } else {
+        int nextHead = (head + 1) % BUFFER_SIZE;
+        if (nextHead != tail) {
+          for (int i = 0; i < NUM_AXES; i++) { moveBuffer[head].steps[i] = stepsToMove[i]; }
+          moveBuffer[head].feed = feed;
+          head = nextHead;
+          Serial.println(F("ok"));
+        } else {
+          Serial.println(F("ERROR: Buffer vol!"));
+        }
+      }
     } else { Serial.println(F("ok")); }
   }
 }
@@ -723,6 +841,7 @@ ISR(TIMER1_COMPA_vect) {
 }
 
 void setup() {
+  wdt_enable(WDTO_2S);
   Serial.begin(115200);
   setupConfig();
   for (int i = 0; i < NUM_AXES; i++) { 
@@ -749,8 +868,47 @@ void setup() {
   Serial.println(F("--- READY ---"));
 }
 void loop() {
+  wdt_reset();
   // 1. CRUCIAAL: Update de loadcell continu op de achtergrond (Non-blocking)
   updateLoadcell();
+
+  // 1a. Tension Quality Tracking (M404 stats)
+  if (state == MOVING && stepCount[3] > 0) { // If A-axis is moving
+    float curW = getWeightKg();
+    if (curW > 0.05) { // Only track if meaningful weight
+      if (curW > maxTension) maxTension = curW;
+      if (curW < minTension) minTension = curW;
+      totalTensionSum += curW;
+      tensionSampleCount++;
+    }
+  }
+
+  // 1b. Background Tension Lock (M403)
+  if (tensionLockActive) {
+    static unsigned long lastLockStep = 0;
+    if (millis() - lastLockStep > 50) {
+      float currentW = getWeightKg();
+      float diff = targetTension - currentW;
+
+      // Only adjust if Z is not being controlled by a coordinated move
+      bool zBusy = (state == MOVING && stepCount[2] > 0);
+
+      if (!zBusy && fabs(diff) > 0.05) {
+        bool moveDown = (diff > 0);
+        bool dir = moveDown;
+        if (axes[2].invertDir) dir = !dir;
+
+        noInterrupts();
+        if (dir) PORTB |= (1 << Z_DIR_BIT); else PORTB &= ~(1 << Z_DIR_BIT);
+        PORTB |= (1 << Z_STEP_BIT);
+        delayMicroseconds(5); // Minimum pulse
+        PORTB &= ~(1 << Z_STEP_BIT);
+        currentPosition[2] += (moveDown ? 1 : -1);
+        interrupts();
+      }
+      lastLockStep = millis();
+    }
+  }
 
   // 2. SAFETY OVERLOAD PROTECTION
   if (homed[2]) {
@@ -761,13 +919,39 @@ void loop() {
       loadcell_seen_1kg = true;
     }
     if (loadcell_seen_1kg && weight > 30.0) {
+      // EMERGENCY OVERLOAD RETRACT
       state = IDLE;
-      Serial.println(F("ALARM: OVERLOAD PROTECT TRIGGERED (>30kg)!"));
+      head = 0; tail = 0; // Flush move buffer
+      isLocked = true;
+
+      Serial.println(F("ALARM: EMERGENCY OVERLOAD! RETRACTING Z..."));
+
+      // Immediate manual retract of 5mm upwards
+      // Upwards = negative direction (homeDirNegative = true for Z)
+      bool dir = false; // Negative
+      if (axes[2].invertDir) dir = !dir;
+      if (dir) PORTB |= (1 << Z_DIR_BIT); else PORTB &= ~(1 << Z_DIR_BIT);
+
+      int steps = round(5.0 * axes[2].stepsPerMM);
+      for(int s=0; s<steps; s++) {
+        wdt_reset();
+        PORTB |= (1 << Z_STEP_BIT);
+        delayMicroseconds(400);
+        PORTB &= ~(1 << Z_STEP_BIT);
+        delayMicroseconds(400);
+        currentPosition[2]--;
+      }
+
+      Serial.println(F("Machine LOCKED. Material safety engaged."));
     }
   }
 
   // 3. SERIAL COMMANDS HANDLING
+  // Stricter buffer control: only read if space available in ring buffer
   while (Serial.available() > 0) {
+    int nextHead = (head + 1) % BUFFER_SIZE;
+    if (nextHead == tail) break;
+
     char c = Serial.read();
     if (c == '\n') { 
       serialBuffer[serialIdx] = '\0'; 
