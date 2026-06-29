@@ -1,0 +1,60 @@
+menu "Machine Hardware Configuration"
+
+    menu "X-Axis Pins"
+        config X_STEP_GPIO
+            int "X Step GPIO"
+            default 1
+        config X_DIR_GPIO
+            int "X Dir GPIO"
+            default 2
+        config X_LIMIT_GPIO
+            int "X Limit GPIO"
+            default 9
+    endmenu
+
+    menu "Y-Axis Pins"
+        config Y_STEP_GPIO
+            int "Y Step GPIO"
+            default 3
+        config Y_DIR_GPIO
+            int "Y Dir GPIO"
+            default 4
+        config Y_LIMIT_GPIO
+            int "Y Limit GPIO"
+            default 10
+    endmenu
+
+    menu "Z-Axis Pins"
+        config Z_STEP_GPIO
+            int "Z Step GPIO"
+            default 5
+        config Z_DIR_GPIO
+            int "Z Dir GPIO"
+            default 6
+        config Z_LIMIT_GPIO
+            int "Z Limit GPIO"
+            default 11
+    endmenu
+
+    menu "A-Axis Pins"
+        config A_STEP_GPIO
+            int "A Step GPIO"
+            default 7
+        config A_DIR_GPIO
+            int "A Dir GPIO"
+            default 8
+        config A_LIMIT_GPIO
+            int "A Limit GPIO"
+            default 12
+    endmenu
+
+    menu "HX711 Loadcell Pins"
+        config HX711_SCK_GPIO
+            int "HX711 SCK GPIO"
+            default 13
+        config HX711_DT_GPIO
+            int "HX711 DT GPIO"
+            default 14
+    endmenu
+
+endmenu
