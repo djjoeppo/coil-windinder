@@ -16,7 +16,7 @@ static const char *TAG = "MOTION_CONTROL";
 typedef enum { IDLE, MOVING, FORCE_SEEKING } motion_state_t;
 typedef enum { HOME_IDLE, HOME_FAST_SEEK, HOME_BACKOFF, HOME_SLOW_SEEK } home_state_t;
 
-static RingbufHandle_t move_buffer;
+static RingbufHandle_t move_buffer = NULL;
 static volatile motion_state_t state = IDLE;
 static volatile home_state_t home_state = HOME_IDLE;
 static volatile int homing_axis = -1;
@@ -127,10 +127,10 @@ static void motion_update_speed(float speed_hz) {
         .reload_count = 0,
         .flags.auto_reload_on_alarm = true,
     };
-    gptimer_set_alarm_action(gptimer, &alarm_config);
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm_config));
 
     if (!timer_running) {
-        gptimer_start(gptimer);
+        ESP_ERROR_CHECK(gptimer_start(gptimer));
         timer_running = true;
     }
 }
@@ -160,6 +160,7 @@ void motion_start_move(move_t *move) {
 }
 
 bool motion_add_move(move_t *move) {
+    if (move_buffer == NULL) return false;
     return xRingbufferSend(move_buffer, move, sizeof(move_t), pdMS_TO_TICKS(10));
 }
 
@@ -323,7 +324,7 @@ void motion_control_task(void *pvParameters) {
                     vRingbufferReturnItem(move_buffer, (void *)move);
                 } else {
                     if (timer_running) {
-                        gptimer_stop(gptimer);
+                        ESP_ERROR_CHECK(gptimer_stop(gptimer));
                         timer_running = false;
                     }
                 }
