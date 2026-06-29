@@ -85,36 +85,32 @@ void app_main(void) {
                                         uart_write_bytes(UART_NUM, "ok\n", 3);
                                     } else {
                                         move_t move = {0};
+                                        long target_steps[4];
 
-                                        if (cmd.has_x) {
-                                            long target = (long)(cmd.x * X_STEPS_PER_MM);
-                                            move.steps[0] = absolute_mode ? (target - planned_position[0]) : target;
-                                            planned_position[0] += move.steps[0];
-                                        }
-                                        if (cmd.has_y) {
-                                            long target = (long)(cmd.y * Y_STEPS_PER_MM);
-                                            move.steps[1] = absolute_mode ? (target - planned_position[1]) : target;
-                                            planned_position[1] += move.steps[1];
-                                        }
-                                        if (cmd.has_z) {
-                                            long target = (long)(cmd.z * Z_STEPS_PER_MM);
-                                            move.steps[2] = absolute_mode ? (target - planned_position[2]) : target;
-                                            planned_position[2] += move.steps[2];
-                                        }
-                                        if (cmd.has_a) {
-                                            long target = (long)(cmd.a * A_STEPS_PER_DEG);
-                                            move.steps[3] = absolute_mode ? (target - planned_position[3]) : target;
-                                            planned_position[3] += move.steps[3];
+                                        if (absolute_mode) {
+                                            target_steps[0] = cmd.has_x ? (long)(cmd.x * X_STEPS_PER_MM)  : planned_position[0];
+                                            target_steps[1] = cmd.has_y ? (long)(cmd.y * Y_STEPS_PER_MM)  : planned_position[1];
+                                            target_steps[2] = cmd.has_z ? (long)(cmd.z * Z_STEPS_PER_MM)  : planned_position[2];
+                                            target_steps[3] = cmd.has_a ? (long)(cmd.a * A_STEPS_PER_DEG) : planned_position[3];
+
+                                            for(int i=0; i<4; i++) {
+                                                move.steps[i] = target_steps[i] - planned_position[i];
+                                            }
+                                        } else {
+                                            move.steps[0] = cmd.has_x ? (long)(cmd.x * X_STEPS_PER_MM)  : 0;
+                                            move.steps[1] = cmd.has_y ? (long)(cmd.y * Y_STEPS_PER_MM)  : 0;
+                                            move.steps[2] = cmd.has_z ? (long)(cmd.z * Z_STEPS_PER_MM)  : 0;
+                                            move.steps[3] = cmd.has_a ? (long)(cmd.a * A_STEPS_PER_DEG) : 0;
                                         }
 
                                         move.feed = cmd.has_f ? cmd.f : DEFAULT_FEED;
 
+                                        // Update planned position BEFORE adding to buffer
+                                        for(int i=0; i<4; i++) planned_position[i] += move.steps[i];
+
                                         if (!motion_add_move(&move)) {
                                             // Revert planned position if buffer is full
-                                            planned_position[0] -= move.steps[0];
-                                            planned_position[1] -= move.steps[1];
-                                            planned_position[2] -= move.steps[2];
-                                            planned_position[3] -= move.steps[3];
+                                            for(int i=0; i<4; i++) planned_position[i] -= move.steps[i];
                                             uart_write_bytes(UART_NUM, "ERROR: Buffer vol!\n", 19);
                                         } else {
                                             uart_write_bytes(UART_NUM, "ok\n", 3);
