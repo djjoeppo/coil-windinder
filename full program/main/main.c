@@ -20,6 +20,7 @@ static const char *TAG = "MAIN";
 
 static bool absolute_mode = true;
 static bool force_mode = false;
+static bool inches_mode = false;
 
 // Virtual position to track planned movements in the buffer
 static long planned_position[4] = {0, 0, 0, 0};
@@ -36,6 +37,16 @@ void uart_init() {
     // Install driver with longer timeout and check for errors
     ESP_ERROR_CHECK(uart_driver_install(UART_NUM, BUF_SIZE * 2, 0, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(UART_NUM, &uart_config));
+}
+
+static void telemetry_task(void *pvParameters) {
+    while (1) {
+        float weight = hx711_get_weight();
+        char msg[32];
+        int len = snprintf(msg, sizeof(msg), "W:%.3f\n", weight);
+        uart_write_bytes(UART_NUM, msg, len);
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
 }
 
 void app_main(void) {
@@ -71,6 +82,10 @@ void app_main(void) {
     xTaskCreatePinnedToCore(hx711_update_task, "hx711_task", 4096, NULL, 5, NULL, 0);
     vTaskDelay(pdMS_TO_TICKS(50));
     
+    // Telemetry task on Core 0
+    xTaskCreatePinnedToCore(telemetry_task, "telemetry_task", 2048, NULL, 4, NULL, 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
     // Motion task on Core 1
     xTaskCreatePinnedToCore(motion_control_task, "motion_task", 8192, NULL, 20, NULL, 1);
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -100,28 +115,45 @@ void app_main(void) {
                                             planned_position[2] = motion_get_position(2);
                                             uart_write_bytes(UART_NUM, "ok\n", 3);
                                         } else {
+                                            float scale = inches_mode ? 25.4f : 1.0f;
                                             move_t move = {0};
                                             long target_steps[4];
 
                                             if (absolute_mode) {
-                                                target_steps[0] = cmd.has_x ? (long)(cmd.x * X_STEPS_PER_MM)  : planned_position[0];
-                                                target_steps[1] = cmd.has_y ? (long)(cmd.y * Y_STEPS_PER_MM)  : planned_position[1];
-                                                target_steps[2] = cmd.has_z ? (long)(cmd.z * Z_STEPS_PER_MM)  : planned_position[2];
+                                                target_steps[0] = cmd.has_x ? (long)(cmd.x * scale * X_STEPS_PER_MM)  : planned_position[0];
+                                                target_steps[1] = cmd.has_y ? (long)(cmd.y * scale * Y_STEPS_PER_MM)  : planned_position[1];
+                                                target_steps[2] = cmd.has_z ? (long)(cmd.z * scale * Z_STEPS_PER_MM)  : planned_position[2];
                                                 target_steps[3] = cmd.has_a ? (long)(cmd.a * A_STEPS_PER_DEG) : planned_position[3];
-                                                
-                                                for(int i=0; i<4; i++) {
-                                                    move.steps[i] = target_steps[i] - planned_position[i];
-                                                }
                                             } else {
-                                                move.steps[0] = cmd.has_x ? (long)(cmd.x * X_STEPS_PER_MM)  : 0;
-                                                move.steps[1] = cmd.has_y ? (long)(cmd.y * Y_STEPS_PER_MM)  : 0;
-                                                move.steps[2] = cmd.has_z ? (long)(cmd.z * Z_STEPS_PER_MM)  : 0;
-                                                move.steps[3] = cmd.has_a ? (long)(cmd.a * A_STEPS_PER_DEG) : 0;
+                                                target_steps[0] = cmd.has_x ? (planned_position[0] + (long)(cmd.x * scale * X_STEPS_PER_MM))  : planned_position[0];
+                                                target_steps[1] = cmd.has_y ? (planned_position[1] + (long)(cmd.y * scale * Y_STEPS_PER_MM))  : planned_position[1];
+                                                target_steps[2] = cmd.has_z ? (planned_position[2] + (long)(cmd.z * scale * Z_STEPS_PER_MM))  : planned_position[2];
+                                                target_steps[3] = cmd.has_a ? (planned_position[3] + (long)(cmd.a * A_STEPS_PER_DEG)) : planned_position[3];
+                                            }
+
+                                            // Enforce soft limits
+                                            if (target_steps[0] < 0) target_steps[0] = 0;
+                                            if (target_steps[0] > (long)(X_MAX_TRAVEL * X_STEPS_PER_MM)) {
+                                                target_steps[0] = (long)(X_MAX_TRAVEL * X_STEPS_PER_MM);
+                                            }
+
+                                            if (target_steps[1] < 0) target_steps[1] = 0;
+                                            if (target_steps[1] > (long)(Y_MAX_TRAVEL * Y_STEPS_PER_MM)) {
+                                                target_steps[1] = (long)(Y_MAX_TRAVEL * Y_STEPS_PER_MM);
+                                            }
+
+                                            if (target_steps[2] < 0) target_steps[2] = 0;
+                                            if (target_steps[2] > (long)(Z_MAX_TRAVEL * Z_STEPS_PER_MM)) {
+                                                target_steps[2] = (long)(Z_MAX_TRAVEL * Z_STEPS_PER_MM);
+                                            }
+
+                                            for (int i = 0; i < 4; i++) {
+                                                move.steps[i] = target_steps[i] - planned_position[i];
                                             }
                                             
-                                            move.feed = cmd.has_f ? cmd.f : DEFAULT_FEED;
+                                            move.feed = cmd.has_f ? (cmd.f * scale) : DEFAULT_FEED;
 
-                                            for(int i=0; i<4; i++) planned_position[i] += move.steps[i];
+                                            for(int i=0; i<4; i++) planned_position[i] = target_steps[i];
 
                                             // === HOOGWAARDIGE STREAMING LOGICA ===
                                             // Als de buffer vol zit, wachten we hier net zo lang tot er door een 
@@ -143,12 +175,14 @@ void app_main(void) {
                                         break;
                                     }
                                     case 20: {
-                                        // G20: Inch modus (We accepteren de code maar blijven in MM werken)
-                                        uart_write_bytes(UART_NUM, "WARNING: Inches niet ondersteund, blijft in MM!\nok\n", 51); 
+                                        // G20: Inch modus
+                                        inches_mode = true;
+                                        uart_write_bytes(UART_NUM, "Modus: Inches actief\nok\n", 28);
                                         break;
                                     }
                                     case 21: {
                                         // G21: Millimeter modus (Standaard)
+                                        inches_mode = false;
                                         uart_write_bytes(UART_NUM, "Modus: Millimeters actief\nok\n", 29); 
                                         break;
                                     }

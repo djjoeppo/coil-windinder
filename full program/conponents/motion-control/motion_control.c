@@ -210,46 +210,68 @@ void motion_start_force_move(float target_weight_kg) {
     ESP_LOGI(TAG, "Starting Force Seek to %.2f kg", target_weight_kg);
     
     int stability_count = 0;
-    bool slow_phase = false;
 
     while (stability_count < 20) {
         float current_weight = hx711_get_weight();
-        if (!slow_phase && current_weight >= 1.0f) {
-            slow_phase = true;
-            ESP_LOGI(TAG, "Force Seek: entering slow phase");
-        }
-
         float diff = target_weight_kg - current_weight;
+
         if (fabs(diff) <= 0.05f) {
             stability_count++;
+            vTaskDelay(pdMS_TO_TICKS(50)); // Wait a bit between stability checks
         } else {
             stability_count = 0;
-            int steps = slow_phase ? 5 : 40;
+            float abs_diff = fabs(diff);
+            int steps = 1;
+
+            // Proportional steps based on distance to target weight
+            if (abs_diff > 1.0f) {
+                steps = 30;
+            } else if (abs_diff > 0.5f) {
+                steps = 15;
+            } else if (abs_diff > 0.2f) {
+                steps = 5;
+            } else {
+                steps = 1;
+            }
+
             bool move_down = (diff > 0);
             
             portENTER_CRITICAL(&motion_mux);
             long pos_z = current_position[2];
             portEXIT_CRITICAL(&motion_mux);
 
-            long next_pos = pos_z + (move_down ? steps : -steps);
-            if (next_pos < 0 || next_pos > (long)(Z_MAX_TRAVEL * Z_STEPS_PER_MM)) {
+            // Limit steps so we don't exceed boundaries
+            long max_z_steps = (long)(Z_MAX_TRAVEL * Z_STEPS_PER_MM);
+            if (move_down) {
+                if (pos_z + steps > max_z_steps) {
+                    steps = max_z_steps - pos_z;
+                }
+            } else {
+                if (pos_z - steps < 0) {
+                    steps = pos_z;
+                }
+            }
+
+            if (steps > 0) {
+                stepper_set_direction(2, move_down);
+                for (int s = 0; s < steps; s++) {
+                    gpio_set_level(step_gpios[2], 1);
+                    esp_rom_delay_us(500);
+                    gpio_set_level(step_gpios[2], 0);
+                    esp_rom_delay_us(500);
+                }
+
+                portENTER_CRITICAL(&motion_mux);
+                current_position[2] += (move_down ? steps : -steps);
+                portEXIT_CRITICAL(&motion_mux);
+
+                // Wait 100ms for the loadcell to sample a fresh reading and stabilize
+                vTaskDelay(pdMS_TO_TICKS(100));
+            } else {
                 ESP_LOGW(TAG, "Force Seek: Soft limit reached!");
                 break;
             }
-
-            stepper_set_direction(2, move_down);
-            for(int s=0; s<steps; s++) {
-                gpio_set_level(step_gpios[2], 1);
-                esp_rom_delay_us(500);
-                gpio_set_level(step_gpios[2], 0);
-                esp_rom_delay_us(500);
-                portENTER_CRITICAL(&motion_mux);
-                current_position[2] += (move_down ? 1 : -1);
-                portEXIT_CRITICAL(&motion_mux);
-            }
         }
-        if (slow_phase) vTaskDelay(pdMS_TO_TICKS(50));
-        else vTaskDelay(pdMS_TO_TICKS(5));
 
         if (current_weight > OVERLOAD_THRESHOLD_KG) {
             ESP_LOGE(TAG, "Force Seek: EMERGENCY OVERLOAD!");
