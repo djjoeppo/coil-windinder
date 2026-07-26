@@ -225,6 +225,16 @@ void app_main(void) {
                                         uart_write_bytes(UART_NUM, msg, l);
                                         break;
                                     }
+                                    case 119: {
+                                        char msg[160];
+                                        int l = snprintf(msg, sizeof(msg), "X_limit: %s  Y_limit: %s  Z_limit: %s  A_limit: %s\nok\n",
+                                            motion_get_limit_triggered(0) ? "TRIGGERED" : "open",
+                                            motion_get_limit_triggered(1) ? "TRIGGERED" : "open",
+                                            motion_get_limit_triggered(2) ? "TRIGGERED" : "open",
+                                            motion_get_limit_triggered(3) ? "TRIGGERED" : "open");
+                                        uart_write_bytes(UART_NUM, msg, l);
+                                        break;
+                                    }
                                 }
                             } else if (cmd.command == 'M') {
                                 switch(cmd.code) {
@@ -283,6 +293,18 @@ void app_main(void) {
                                         }
                                         hx711_tare(15);
                                         uart_write_bytes(UART_NUM, "ok\n", 3);
+                                        break;
+                                    }
+                                    case 403: {
+                                        if (cmd.has_z && cmd.z > 0.0f) {
+                                            motion_set_tension_lock(true, cmd.z);
+                                            char msg[64];
+                                            int len = snprintf(msg, sizeof(msg), "Tension Lock active target: %.2f kg\nok\n", cmd.z);
+                                            uart_write_bytes(UART_NUM, msg, len);
+                                        } else {
+                                            motion_set_tension_lock(false, 0.0f);
+                                            uart_write_bytes(UART_NUM, "Tension Lock disabled\nok\n", 26);
+                                        }
                                         break;
                                     }
                                     default: {

@@ -18,6 +18,42 @@ static SemaphoreHandle_t hx711_mutex = NULL;
 // Spinlock for thread-safe access to shared variables
 static portMUX_TYPE hx711_vars_mux = portMUX_INITIALIZER_UNLOCKED;
 
+// Loadcell Multi-Point Calibration Profile
+typedef struct {
+    float raw_kg;       // Raw calculated weight (using standard divider)
+    float actual_kg;    // Actual calibrated weight measured with reference weights
+} cal_point_t;
+
+#define CAL_POINTS_NUM 5
+static const cal_point_t cal_table[CAL_POINTS_NUM] = {
+    { 0.0f,   0.0f },
+    { 5.0f,   5.0f },
+    { 10.0f,  10.02f },  // Example of micro-corrections for loadcell non-linearity
+    { 20.0f,  19.95f },
+    { 30.0f,  30.0f }
+};
+
+static float hx711_apply_calibration(float raw_kg) {
+    if (raw_kg <= cal_table[0].raw_kg) {
+        return raw_kg; // Below first point, return raw
+    }
+    if (raw_kg >= cal_table[CAL_POINTS_NUM - 1].raw_kg) {
+        // Extrapolate above last point
+        int last = CAL_POINTS_NUM - 1;
+        float ratio = (raw_kg - cal_table[last - 1].raw_kg) / (cal_table[last].raw_kg - cal_table[last - 1].raw_kg);
+        return cal_table[last - 1].actual_kg + ratio * (cal_table[last].actual_kg - cal_table[last - 1].actual_kg);
+    }
+
+    // Find the interval
+    for (int i = 0; i < CAL_POINTS_NUM - 1; i++) {
+        if (raw_kg >= cal_table[i].raw_kg && raw_kg <= cal_table[i + 1].raw_kg) {
+            float ratio = (raw_kg - cal_table[i].raw_kg) / (cal_table[i + 1].raw_kg - cal_table[i].raw_kg);
+            return cal_table[i].actual_kg + ratio * (cal_table[i + 1].actual_kg - cal_table[i].actual_kg);
+        }
+    }
+    return raw_kg;
+}
+
 void hx711_init(hx711_config_t *config) {
     hx_cfg = *config;
 
@@ -117,7 +153,7 @@ float hx711_get_weight(void) {
     w = filtered_weight;
     portEXIT_CRITICAL(&hx711_vars_mux);
 
-    if (fabs(w) < 0.03f) return 0.0f;
+    if (fabs(w) < 0.05f) return 0.0f; // Deadband filter around 0
     return w;
 }
 
@@ -134,6 +170,9 @@ void hx711_update_task(void *pvParameters) {
             if (raw != 0 && raw != -8388608) {
                 float current = (float)(hx_cfg.offset - raw) / hx_cfg.divider;
                 
+                // Apply Multi-Point Calibration Profile
+                current = hx711_apply_calibration(current);
+
                 if (fabs(current - prev_weight) < 15.0f) {
                      portENTER_CRITICAL(&hx711_vars_mux);
                      filtered_weight = (current * 0.25f) + (filtered_weight * 0.75f);

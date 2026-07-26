@@ -35,6 +35,8 @@ typedef enum { HOME_IDLE, HOME_FAST_SEEK, HOME_BACKOFF, HOME_SLOW_SEEK } home_st
 
 static RingbufHandle_t move_buffer = NULL;
 static volatile motion_state_t state = IDLE;
+static volatile bool tension_lock_active = false;
+static volatile float tension_lock_target = 0.0f;
 static volatile home_state_t home_state = HOME_IDLE;
 static volatile int homing_axis = -1;
 
@@ -240,6 +242,18 @@ void motion_stop(void) {
     }
 }
 
+bool motion_get_limit_triggered(int axis) {
+    if (axis < 0 || axis >= 4) return false;
+    return is_limit_triggered(axis);
+}
+
+void motion_set_tension_lock(bool active, float target_kg) {
+    portENTER_CRITICAL(&motion_mux);
+    tension_lock_active = active;
+    tension_lock_target = target_kg;
+    portEXIT_CRITICAL(&motion_mux);
+}
+
 bool motion_is_idle(void) {
     return state == IDLE && home_state == HOME_IDLE;
 }
@@ -337,6 +351,45 @@ void motion_control_task(void *pvParameters) {
             continue;
         }
 
+        if (state == IDLE && tension_lock_active) {
+            float current_weight = hx711_get_weight();
+            float diff = tension_lock_target - current_weight;
+            if (fabs(diff) > 0.05f) {
+                int steps = (fabs(diff) > 0.3f) ? 5 : 1;
+                bool move_down = (diff > 0);
+
+                portENTER_CRITICAL(&motion_mux);
+                long pos_z = current_position[2];
+                portEXIT_CRITICAL(&motion_mux);
+
+                long max_z_steps = (long)(Z_MAX_TRAVEL * Z_STEPS_PER_MM);
+                if (move_down) {
+                    if (pos_z + steps > max_z_steps) {
+                        steps = max_z_steps - pos_z;
+                    }
+                } else {
+                    if (pos_z - steps < 0) {
+                        steps = pos_z;
+                    }
+                }
+
+                if (steps > 0) {
+                    stepper_set_direction(2, move_down);
+                    for (int s = 0; s < steps; s++) {
+                        gpio_set_level_fast(step_gpios[2], 1);
+                        esp_rom_delay_us(500);
+                        gpio_set_level_fast(step_gpios[2], 0);
+                        esp_rom_delay_us(500);
+                    }
+                    portENTER_CRITICAL(&motion_mux);
+                    current_position[2] += (move_down ? steps : -steps);
+                    portEXIT_CRITICAL(&motion_mux);
+                }
+                vTaskDelay(pdMS_TO_TICKS(100)); // Delay to let the sensor update and physically stabilize
+                continue;
+            }
+        }
+
         uint64_t now = esp_timer_get_time();
         float dt = (now - last_time) / 1000000.0f;
         last_time = now;
@@ -353,14 +406,29 @@ void motion_control_task(void *pvParameters) {
                 // Kijk of er al een volgende beweging klaarstaat in de buffer
                 move_t *next_move = (move_t *)xRingbufferReceive(move_buffer, &item_size, 0);
                 if (next_move) {
+                    bool reverses_direction = false;
+                    for (int i = 0; i < 4; i++) {
+                        // Check of as van richting verandert tussen huidige en volgende beweging
+                        if (labs(next_move->steps[i]) > 0 && step_count[i] > 0) {
+                            int next_dir = (next_move->steps[i] > 0) ? 1 : -1;
+                            if (next_dir != move_dir[i]) {
+                                reverses_direction = true;
+                                break;
+                            }
+                        }
+                    }
+
                     float saved_speed = current_speed; // Onthoud de huidige vaart!
                     
                     motion_start_move(next_move);
                     
-                    // Schakel de snelheid vloeiend over in plaats van te resetten naar 0
+                    // Schakel de snelheid vloeiend over in plaats van te resetten naar 0,
+                    // BEHALVE als een as van richting verandert om stappenverlies te voorkomen!
                     portENTER_CRITICAL(&motion_mux);
-                    if (saved_speed > 10.0f) {
+                    if (!reverses_direction && saved_speed > 10.0f) {
                         current_speed = saved_speed; 
+                    } else {
+                        current_speed = 10.0f; // Reset naar een veilige startsnelheid bij richtingsverandering
                     }
                     portEXIT_CRITICAL(&motion_mux);
                     

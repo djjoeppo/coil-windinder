@@ -17,6 +17,8 @@ void motion_set_absolute(bool absolute);
 bool motion_is_idle(void);
 long motion_get_position(int axis);
 void motion_stop(void);
+bool motion_get_limit_triggered(int axis);
+void motion_set_tension_lock(bool active, float target_kg);
 
 // Task functions
 void motion_control_task(void *pvParameters);
