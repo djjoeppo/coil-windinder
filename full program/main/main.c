@@ -6,6 +6,7 @@
 #include "esp_system.h"
 #include "esp_log.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 
 #include "machine_settings.h"
 #include "hx711.h"
@@ -61,7 +62,7 @@ void app_main(void) {
 
     hx711_config_t hx_cfg = {
         .sck_pin = CONFIG_HX711_SCK_GPIO,
-        .dt_pin = CONFIG_HX711_DT_GPIO,
+        .dt_pin = CONFIG_HX711_DOUT_GPIO,
         .offset = 0,
         .divider = 34355.26f
     };
