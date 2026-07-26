@@ -9,6 +9,7 @@
 
 static hx711_config_t hx_cfg;
 static volatile float filtered_weight = 0.0f;
+static volatile float instant_weight = 0.0f;
 static volatile bool is_online = false;
 static int64_t last_read_time = 0;
 
@@ -157,6 +158,21 @@ float hx711_get_weight(void) {
     return w;
 }
 
+float hx711_get_instant_weight(void) {
+    if ((esp_timer_get_time() - last_read_time) > 500000) {
+        is_online = false;
+        return 0.0f;
+    }
+
+    float w;
+    portENTER_CRITICAL(&hx711_vars_mux);
+    w = instant_weight;
+    portEXIT_CRITICAL(&hx711_vars_mux);
+
+    if (fabs(w) < 0.05f) return 0.0f;
+    return w;
+}
+
 bool hx711_is_online(void) {
     return is_online;
 }
@@ -175,6 +191,7 @@ void hx711_update_task(void *pvParameters) {
 
                 if (fabs(current - prev_weight) < 15.0f) {
                      portENTER_CRITICAL(&hx711_vars_mux);
+                     instant_weight = current;
                      filtered_weight = (current * 0.25f) + (filtered_weight * 0.75f);
                      portEXIT_CRITICAL(&hx711_vars_mux);
                 }

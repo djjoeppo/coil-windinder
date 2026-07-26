@@ -272,6 +272,20 @@ bool motion_is_idle(void) {
     return state == IDLE && home_state == HOME_IDLE;
 }
 
+static float get_stable_instant_weight(void) {
+    float sum = 0;
+    int valid = 0;
+    for (int i = 0; i < 5; i++) {
+        float w = hx711_get_instant_weight();
+        if (w != 0.0f) {
+            sum += w;
+            valid++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return (valid > 0) ? (sum / valid) : 0.0f;
+}
+
 void motion_start_force_move(float target_weight_kg) {
     portENTER_CRITICAL(&motion_mux);
     state = FORCE_SEEKING;
@@ -282,7 +296,9 @@ void motion_start_force_move(float target_weight_kg) {
     int stability_count = 0;
 
     while (stability_count < 20) {
-        float current_weight = hx711_get_weight();
+        // Use a highly responsive 5-point moving average over 50ms of the raw instant weights
+        // This is extremely responsive (lag-free) and completely filters out electrical noise
+        float current_weight = get_stable_instant_weight();
         float diff = target_weight_kg - current_weight;
 
         if (fabs(diff) <= 0.05f) {
@@ -292,16 +308,27 @@ void motion_start_force_move(float target_weight_kg) {
             stability_count = 0;
             float abs_diff = fabs(diff);
             int steps = 1;
+            int delay_ms = 40;
 
-            // Proportional steps based on distance to target weight
-            if (abs_diff > 1.0f) {
-                steps = 30;
-            } else if (abs_diff > 0.5f) {
-                steps = 15;
-            } else if (abs_diff > 0.2f) {
-                steps = 5;
+            // If we are still in the air (weight is very low), descend rapidly
+            if (current_weight <= 0.15f) {
+                steps = 150;
+                delay_ms = 10; // High-speed approach through the air
             } else {
-                steps = 1;
+                // Proportional discrete steps and long settling delays when touching the spool
+                if (abs_diff > 0.6f) {
+                    steps = 60;
+                    delay_ms = 40;  // Large steps, let filter stabilize
+                } else if (abs_diff > 0.3f) {
+                    steps = 20;
+                    delay_ms = 60;
+                } else if (abs_diff > 0.1f) {
+                    steps = 5;
+                    delay_ms = 80;
+                } else {
+                    steps = 1;
+                    delay_ms = 100; // Single step micro-adjustments
+                }
             }
 
             bool move_down = (diff > 0);
@@ -324,19 +351,20 @@ void motion_start_force_move(float target_weight_kg) {
 
             if (steps > 0) {
                 stepper_set_direction(2, move_down);
+                // Pulse Z stepper fast (100us pulse) to achieve high-speed motion without active stall
                 for (int s = 0; s < steps; s++) {
-                    gpio_set_level(step_gpios[2], 1);
-                    esp_rom_delay_us(500);
-                    gpio_set_level(step_gpios[2], 0);
-                    esp_rom_delay_us(500);
+                    gpio_set_level_fast(step_gpios[2], 1);
+                    esp_rom_delay_us(100);
+                    gpio_set_level_fast(step_gpios[2], 0);
+                    esp_rom_delay_us(100);
                 }
 
                 portENTER_CRITICAL(&motion_mux);
                 current_position[2] += (move_down ? steps : -steps);
                 portEXIT_CRITICAL(&motion_mux);
 
-                // Wait 100ms for the loadcell to sample a fresh reading and stabilize
-                vTaskDelay(pdMS_TO_TICKS(100));
+                // Wait appropriate time to allow loadcell readings to settle
+                vTaskDelay(pdMS_TO_TICKS(delay_ms));
             } else {
                 ESP_LOGW(TAG, "Force Seek: Soft limit reached!");
                 break;
@@ -366,10 +394,18 @@ void motion_control_task(void *pvParameters) {
         }
 
         if (state == IDLE && tension_lock_active) {
+            // Use stable EMA-filtered weight to completely filter out electrical noise from long cable
             float current_weight = hx711_get_weight();
             float diff = tension_lock_target - current_weight;
             if (fabs(diff) > 0.05f) {
-                int steps = (fabs(diff) > 0.3f) ? 5 : 1;
+                float abs_diff = fabs(diff);
+                int steps = 1;
+                if (abs_diff > 0.5f) {
+                    steps = 5;
+                } else {
+                    steps = 1;
+                }
+
                 bool move_down = (diff > 0);
 
                 portENTER_CRITICAL(&motion_mux);
@@ -399,7 +435,7 @@ void motion_control_task(void *pvParameters) {
                     current_position[2] += (move_down ? steps : -steps);
                     portEXIT_CRITICAL(&motion_mux);
                 }
-                vTaskDelay(pdMS_TO_TICKS(100)); // Delay to let the sensor update and physically stabilize
+                vTaskDelay(pdMS_TO_TICKS(80)); // Delay to let the sensor update and physically stabilize
                 continue;
             }
         }

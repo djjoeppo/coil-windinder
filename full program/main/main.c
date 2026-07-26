@@ -214,9 +214,36 @@ void app_main(void) {
                                         // Geef de achtergrondtaak heel even de tijd om de motoren te starten
                                         vTaskDelay(pdMS_TO_TICKS(150));
                                         
+                                        // Wacht zolang de machine nog bezig is, maar lees ondertussen de UART voor noodstops!
+                                        while (!motion_is_idle()) {
+                                            int len = uart_read_bytes(UART_NUM, data, BUF_SIZE, 10 / portTICK_PERIOD_MS);
+                                            if (len > 0) {
+                                                for (int i = 0; i < len; i++) {
+                                                    char c = data[i];
+                                                    if (c == '\n' || c == '\r') {
+                                                        line[line_idx] = '\0';
+                                                        if (line_idx > 0) {
+                                                            gcode_command_t e_cmd;
+                                                            if (gcode_parse_line(line, &e_cmd) && e_cmd.command == 'M' && (e_cmd.code == 112 || e_cmd.code == 410)) {
+                                                                motion_stop();
+                                                                uart_write_bytes(UART_NUM, "Emergency Stop Activated! Homing Aborted.\nok\n", 47);
+                                                                line_idx = 0;
+                                                                goto homing_aborted;
+                                                            }
+                                                        }
+                                                        line_idx = 0;
+                                                    } else if (line_idx < sizeof(line) - 1) {
+                                                        line[line_idx++] = (char)c;
+                                                    }
+                                                }
+                                            }
+                                            vTaskDelay(pdMS_TO_TICKS(10));
+                                        }
+
                                         // Nu pas resetten we de posities en geven we het 'ok' signaal
                                         for(int i=0; i<4; i++) planned_position[i] = 0;
                                         uart_write_bytes(UART_NUM, "ok\n", 3); 
+                                    homing_aborted:
                                         break;
                                     }
                                     case 90: absolute_mode = true; uart_write_bytes(UART_NUM, "ok\n", 3); break;
