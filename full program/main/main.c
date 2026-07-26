@@ -77,6 +77,17 @@ void app_main(void) {
     stepper_init_axis(3, CONFIG_A_STEP_GPIO, CONFIG_A_DIR_GPIO, A_INVERT_DIR);
     vTaskDelay(pdMS_TO_TICKS(50));
 
+    // Initialize the physical button pin (GPIO 18) with internal pullup enabled
+    gpio_config_t button_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << CONFIG_BUTTON_GPIO),
+        .pull_down_en = 0,
+        .pull_up_en = 1
+    };
+    gpio_config(&button_conf);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
     // 2. Start Background Tasks
     // HX711 Update on Core 0
     xTaskCreatePinnedToCore(hx711_update_task, "hx711_task", 4096, NULL, 5, NULL, 0);
@@ -110,6 +121,10 @@ void app_main(void) {
                                 switch(cmd.code) {
                                     case 0:
                                     case 1: {
+                                        // Wait for previous movements or homing to complete
+                                        while (!motion_is_idle()) {
+                                            vTaskDelay(pdMS_TO_TICKS(10));
+                                        }
                                         if (force_mode && cmd.has_z) {
                                             motion_start_force_move(cmd.z);
                                             planned_position[2] = motion_get_position(2);
@@ -187,16 +202,15 @@ void app_main(void) {
                                         break;
                                     }
                                     case 28: {
+                                        // Wait for previous movements to complete
+                                        while (!motion_is_idle()) {
+                                            vTaskDelay(pdMS_TO_TICKS(10));
+                                        }
                                         // Start de homing procedure
                                         motion_start_homing(); 
                                         
                                         // Geef de achtergrondtaak heel even de tijd om de motoren te starten
                                         vTaskDelay(pdMS_TO_TICKS(150));
-                                        
-                                        // Wacht zolang de machine nog bezig is (niet idle is) met bewegen/homen
-                                        while (!motion_is_idle()) {
-                                            vTaskDelay(pdMS_TO_TICKS(50));
-                                        }
                                         
                                         // Nu pas resetten we de posities en geven we het 'ok' signaal
                                         for(int i=0; i<4; i++) planned_position[i] = 0;
@@ -214,6 +228,28 @@ void app_main(void) {
                                 }
                             } else if (cmd.command == 'M') {
                                 switch(cmd.code) {
+                                    case 0: {
+                                        // M0: Pauzeer en wacht tot de fysieke knop op GPIO 18 wordt ingedrukt
+                                        uart_write_bytes(UART_NUM, "Wachten op knopindruk...\n", 25);
+
+                                        // Wacht eerst tot alle lopende motorbewegingen voltooid zijn
+                                        while (!motion_is_idle()) {
+                                            vTaskDelay(pdMS_TO_TICKS(10));
+                                        }
+
+                                        // Wacht tot de knop is ingedrukt (GPIO 18 gaat LOW)
+                                        while (gpio_get_level(CONFIG_BUTTON_GPIO) == 1) {
+                                            vTaskDelay(pdMS_TO_TICKS(50));
+                                        }
+
+                                        // Wacht tot de knop is losgelaten (GPIO 18 gaat terug HIGH) om dubbel-trigger te voorkomen
+                                        while (gpio_get_level(CONFIG_BUTTON_GPIO) == 0) {
+                                            vTaskDelay(pdMS_TO_TICKS(50));
+                                        }
+
+                                        uart_write_bytes(UART_NUM, "Knop ingedrukt! Hervat programma.\nok\n", 38);
+                                        break;
+                                    }
                                     case 30: {
                                         // M30: Einde van het programma, herstel standaard modi
                                         absolute_mode = true;
@@ -233,9 +269,22 @@ void app_main(void) {
                                         uart_write_bytes(UART_NUM, msg, l);
                                         break;
                                     }
+                                    case 112:
+                                    case 410: {
+                                        motion_stop();
+                                        uart_write_bytes(UART_NUM, "Emergency Stop Activated! System Halted.\nok\n", 45);
+                                        break;
+                                    }
                                     case 400: force_mode = false; uart_write_bytes(UART_NUM, "ok\n", 3); break;
                                     case 401: force_mode = true; uart_write_bytes(UART_NUM, "ok\n", 3); break;
-                                    case 402: hx711_tare(15); uart_write_bytes(UART_NUM, "ok\n", 3); break;
+                                    case 402: {
+                                        while (!motion_is_idle()) {
+                                            vTaskDelay(pdMS_TO_TICKS(10));
+                                        }
+                                        hx711_tare(15);
+                                        uart_write_bytes(UART_NUM, "ok\n", 3);
+                                        break;
+                                    }
                                     default: {
                                         char msg[32];
                                         int l = snprintf(msg, sizeof(msg), "Unknown M%d\n", cmd.code);

@@ -67,4 +67,7 @@
 #define CONFIG_HX711_DOUT_GPIO  4   
 #define CONFIG_HX711_SCK_GPIO   5
 
+// --- INPUT BUTTON CONFIGURATION ---
+#define CONFIG_BUTTON_GPIO      18  // Physical button input pin (with internal pullup)
+
 #endif // MACHINE_SETTINGS_H

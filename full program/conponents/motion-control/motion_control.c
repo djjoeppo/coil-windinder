@@ -10,8 +10,25 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include <math.h>
+#include "soc/gpio_reg.h"
 
 static const char *TAG = "MOTION_CONTROL";
+
+static inline void IRAM_ATTR gpio_set_level_fast(int gpio_num, uint32_t level) {
+    if (gpio_num < 32) {
+        if (level) {
+            REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << gpio_num));
+        } else {
+            REG_WRITE(GPIO_OUT_W1TC_REG, (1UL << gpio_num));
+        }
+    } else {
+        if (level) {
+            REG_WRITE(GPIO_OUT1_W1TS_REG, (1UL << (gpio_num - 32)));
+        } else {
+            REG_WRITE(GPIO_OUT1_W1TC_REG, (1UL << (gpio_num - 32)));
+        }
+    }
+}
 
 typedef enum { IDLE, MOVING, FORCE_SEEKING } motion_state_t;
 typedef enum { HOME_IDLE, HOME_FAST_SEEK, HOME_BACKOFF, HOME_SLOW_SEEK } home_state_t;
@@ -50,14 +67,18 @@ static bool IRAM_ATTR is_limit_triggered(int axis) {
 
 static bool IRAM_ATTR motion_timer_cb(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
     if (state != MOVING || dominant_steps_remaining <= 0) {
+        portENTER_CRITICAL_ISR(&motion_mux);
         state = IDLE;
+        portEXIT_CRITICAL_ISR(&motion_mux);
         return false;
     }
 
     if (homing_axis >= 0 && home_state != HOME_BACKOFF) {
         if (is_limit_triggered(homing_axis)) {
+            portENTER_CRITICAL_ISR(&motion_mux);
             state = IDLE;
             dominant_steps_remaining = 0;
+            portEXIT_CRITICAL_ISR(&motion_mux);
             return false;
         }
     }
@@ -67,12 +88,13 @@ static bool IRAM_ATTR motion_timer_cb(gptimer_handle_t timer, const gptimer_alar
 
     if (phase) {
         for (int i = 0; i < 4; i++) {
-            if (do_step[i]) gpio_set_level(step_gpios[i], 1);
+            if (do_step[i]) gpio_set_level_fast(step_gpios[i], 1);
         }
     } else {
+        portENTER_CRITICAL_ISR(&motion_mux);
         for (int i = 0; i < 4; i++) {
             if (do_step[i]) {
-                gpio_set_level(step_gpios[i], 0);
+                gpio_set_level_fast(step_gpios[i], 0);
                 current_position[i] += move_dir[i];
             }
             if (dominant_steps_remaining > 1) {
@@ -86,6 +108,7 @@ static bool IRAM_ATTR motion_timer_cb(gptimer_handle_t timer, const gptimer_alar
             }
         }
         dominant_steps_remaining--;
+        portEXIT_CRITICAL_ISR(&motion_mux);
     }
     return false;
 }
@@ -196,6 +219,25 @@ long motion_get_position(int axis) {
     pos = current_position[axis];
     portEXIT_CRITICAL(&motion_mux);
     return pos;
+}
+
+void motion_stop(void) {
+    portENTER_CRITICAL(&motion_mux);
+    state = IDLE;
+    home_state = HOME_IDLE;
+    homing_axis = -1;
+    dominant_steps_remaining = 0;
+    portEXIT_CRITICAL(&motion_mux);
+
+    if (move_buffer != NULL) {
+        size_t item_size;
+        // Drain the ringbuffer completely
+        while (1) {
+            void *item = xRingbufferReceive(move_buffer, &item_size, 0);
+            if (item == NULL) break;
+            vRingbufferReturnItem(move_buffer, item);
+        }
+    }
 }
 
 bool motion_is_idle(void) {

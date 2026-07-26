@@ -47,7 +47,7 @@ long hx711_read_raw(void) {
         return 0; // Hardware busy
     }
 
-    int timeout = 1000;
+    int timeout = 10; // Reduced from 1000 to prevent system lag when disconnected
     while (gpio_get_level(hx_cfg.dt_pin)) {
         vTaskDelay(pdMS_TO_TICKS(1));
         if (--timeout == 0) {
