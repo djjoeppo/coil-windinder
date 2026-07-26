@@ -37,6 +37,8 @@ static RingbufHandle_t move_buffer = NULL;
 static volatile motion_state_t state = IDLE;
 static volatile bool tension_lock_active = false;
 static volatile float tension_lock_target = 0.0f;
+static volatile int prev_move_dir[4] = {0, 0, 0, 0};
+static const int backlash_steps[4] = { BACKLASH_X_STEPS, BACKLASH_Y_STEPS, BACKLASH_Z_STEPS, BACKLASH_A_STEPS };
 static volatile home_state_t home_state = HOME_IDLE;
 static volatile int homing_axis = -1;
 
@@ -162,6 +164,18 @@ static void motion_update_speed(float speed_hz) {
 
 void motion_start_move(move_t *move) {
     portENTER_CRITICAL(&motion_mux);
+
+    // Apply Backlash Compensation
+    for (int i = 0; i < 4; i++) {
+        if (move->steps[i] != 0) {
+            int new_dir = (move->steps[i] > 0) ? 1 : -1;
+            if (prev_move_dir[i] != 0 && new_dir != prev_move_dir[i]) {
+                move->steps[i] += (new_dir > 0) ? backlash_steps[i] : -backlash_steps[i];
+            }
+            prev_move_dir[i] = new_dir;
+        }
+    }
+
     dominant_steps_total = 0;
     for (int i = 0; i < 4; i++) {
         step_count[i] = labs(move->steps[i]);

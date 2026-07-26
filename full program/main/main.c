@@ -42,8 +42,9 @@ void uart_init() {
 static void telemetry_task(void *pvParameters) {
     while (1) {
         float weight = hx711_get_weight();
-        char msg[32];
-        int len = snprintf(msg, sizeof(msg), "W:%.3f\n", weight);
+        float turns = (float)motion_get_position(3) / 1280.0f; // 1280 steps per full rotation of A-axis
+        char msg[48];
+        int len = snprintf(msg, sizeof(msg), "W:%.3f T:%.2f\n", weight, turns);
         uart_write_bytes(UART_NUM, msg, len);
         vTaskDelay(pdMS_TO_TICKS(200));
     }
@@ -285,8 +286,22 @@ void app_main(void) {
                                         uart_write_bytes(UART_NUM, "Emergency Stop Activated! System Halted.\nok\n", 45);
                                         break;
                                     }
-                                    case 400: force_mode = false; uart_write_bytes(UART_NUM, "ok\n", 3); break;
-                                    case 401: force_mode = true; uart_write_bytes(UART_NUM, "ok\n", 3); break;
+                                    case 400: {
+                                        while (!motion_is_idle()) {
+                                            vTaskDelay(pdMS_TO_TICKS(10));
+                                        }
+                                        force_mode = false;
+                                        uart_write_bytes(UART_NUM, "ok\n", 3);
+                                        break;
+                                    }
+                                    case 401: {
+                                        while (!motion_is_idle()) {
+                                            vTaskDelay(pdMS_TO_TICKS(10));
+                                        }
+                                        force_mode = true;
+                                        uart_write_bytes(UART_NUM, "ok\n", 3);
+                                        break;
+                                    }
                                     case 402: {
                                         while (!motion_is_idle()) {
                                             vTaskDelay(pdMS_TO_TICKS(10));
