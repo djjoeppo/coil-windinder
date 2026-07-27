@@ -1,3 +1,3 @@
 idf_component_register(SRCS "main.c"
                       INCLUDE_DIRS "."
-                      PRIV_REQUIRES esp_driver_uart vfs motion_control hx711 gcode_parser stepper)
+                      PRIV_REQUIRES esp_driver_uart vfs motion_control hx711 gcode_parser stepper esp_driver_gpio)

@@ -15,6 +15,8 @@ void hx711_init(hx711_config_t *config);
 long hx711_read_raw(void);
 void hx711_tare(int samples);
 float hx711_get_weight(void);
+float hx711_get_instant_weight(void);
+float hx711_get_direct_stable_weight(void);
 bool hx711_is_online(void);
 
 // Task for background updates
