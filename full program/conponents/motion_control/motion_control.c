@@ -277,60 +277,74 @@ void motion_start_force_move(float target_weight_kg) {
     state = FORCE_SEEKING;
     portEXIT_CRITICAL(&motion_mux);
 
-    ESP_LOGI(TAG, "Starting Force Seek to %.2f kg", target_weight_kg);
+    ESP_LOGI(TAG, "Starting Adaptive Force Seek to %.2f kg", target_weight_kg);
     
     int stability_count = 0;
 
+    // Adaptive rigidity estimation (conservative default 200 steps per kg)
+    static float steps_per_kg = 200.0f;
+
+    // Read starting weight and position
+    float prev_weight = hx711_get_direct_stable_weight();
+    portENTER_CRITICAL(&motion_mux);
+    long prev_pos = current_position[2];
+    portEXIT_CRITICAL(&motion_mux);
+
     while (stability_count < 20) {
-        // Use direct stable weight reading with 3-point noise averaging and zero core-0 task starvation lag
+        // Read current weight using direct 3-point noise-averaged sensor access
         float current_weight = hx711_get_direct_stable_weight();
         float diff = target_weight_kg - current_weight;
 
+        portENTER_CRITICAL(&motion_mux);
+        long current_pos = current_position[2];
+        portEXIT_CRITICAL(&motion_mux);
+
+        // Update steps_per_kg based on the actual physical weight change from the last movement
+        float delta_w = current_weight - prev_weight;
+        long delta_s = labs(current_pos - prev_pos);
+        if (delta_s > 10 && fabs(delta_w) > 0.1f) {
+            float measured_steps_per_kg = (float)delta_s / fabs(delta_w);
+            // Constrain estimate to a safe, physical range [100.0, 800.0] and apply EMA smoothing
+            if (measured_steps_per_kg >= 100.0f && measured_steps_per_kg <= 800.0f) {
+                steps_per_kg = (measured_steps_per_kg * 0.3f) + (steps_per_kg * 0.7f);
+            }
+        }
+
+        prev_weight = current_weight;
+        prev_pos = current_pos;
+
         if (fabs(diff) <= 0.05f) {
             stability_count++;
-            vTaskDelay(pdMS_TO_TICKS(50)); // Wait a bit between stability checks
+            vTaskDelay(pdMS_TO_TICKS(100)); // Sleep between stability checks
         } else {
             stability_count = 0;
             float abs_diff = fabs(diff);
-            int steps = 1;
-            int delay_ms = 80;
 
-            // Safe, fast approach and proportional scaling to avoid overshoot
-            if (abs_diff > 1.2f) {
-                steps = 40;
-                delay_ms = 30;  // High-speed approach when far
-            } else if (abs_diff > 0.6f) {
-                steps = 20;
-                delay_ms = 40;
-            } else if (abs_diff > 0.2f) {
-                steps = 5;
-                delay_ms = 60;
-            } else {
-                steps = 1;
-                delay_ms = 80; // Ultra-fine stepping
-            }
+            // Calculate required steps using our self-adaptive steps_per_kg verhouding
+            float required_steps = abs_diff * steps_per_kg;
+
+            // Apply 50% damping factor (relaxation) to completely prevent overshoot
+            int steps = (int)(required_steps * 0.50f);
+            if (steps < 1) steps = 1;      // Ensure we still make fine micro-steps
+            if (steps > 100) steps = 100;  // Cap maximum step size to stay safe
 
             bool move_down = (diff > 0);
-            
-            portENTER_CRITICAL(&motion_mux);
-            long pos_z = current_position[2];
-            portEXIT_CRITICAL(&motion_mux);
 
             // Limit steps so we don't exceed boundaries
             long max_z_steps = (long)(Z_MAX_TRAVEL * Z_STEPS_PER_MM);
             if (move_down) {
-                if (pos_z + steps > max_z_steps) {
-                    steps = max_z_steps - pos_z;
+                if (current_pos + steps > max_z_steps) {
+                    steps = max_z_steps - current_pos;
                 }
             } else {
-                if (pos_z - steps < 0) {
-                    steps = pos_z;
+                if (current_pos - steps < 0) {
+                    steps = current_pos;
                 }
             }
 
             if (steps > 0) {
                 stepper_set_direction(2, move_down);
-                // Pulse Z stepper fast (100us pulse) to achieve high-speed motion without active stall
+                // Pulse Z stepper (100us pulse width)
                 for (int s = 0; s < steps; s++) {
                     gpio_set_level_fast(step_gpios[2], 1);
                     esp_rom_delay_us(100);
@@ -342,8 +356,9 @@ void motion_start_force_move(float target_weight_kg) {
                 current_position[2] += (move_down ? steps : -steps);
                 portEXIT_CRITICAL(&motion_mux);
 
-                // Wait appropriate time to allow loadcell readings to settle
-                vTaskDelay(pdMS_TO_TICKS(delay_ms));
+                // Wait 200ms after taking steps to let the wire tension physically settle
+                // and give the loadcell filter time to produce fresh stable values.
+                vTaskDelay(pdMS_TO_TICKS(200));
             } else {
                 ESP_LOGW(TAG, "Force Seek: Soft limit reached!");
                 break;
