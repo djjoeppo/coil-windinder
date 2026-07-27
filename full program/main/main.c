@@ -268,25 +268,73 @@ void app_main(void) {
                             } else if (cmd.command == 'M') {
                                 switch(cmd.code) {
                                     case 0: {
-                                        // M0: Pauzeer en wacht tot de fysieke knop op GPIO 18 wordt ingedrukt
-                                        uart_write_bytes(UART_NUM, "Wachten op knopindruk...\n", 25);
+                                        // M0: Pauzeer en wacht tot de fysieke knop op GPIO 18 wordt ingedrukt OF M108/START over UART wordt ontvangen
+                                        uart_write_bytes(UART_NUM, "Wachten op knopindruk of START commando...\n", 43);
 
                                         // Wacht eerst tot alle lopende motorbewegingen voltooid zijn
                                         while (!motion_is_idle()) {
                                             vTaskDelay(pdMS_TO_TICKS(10));
                                         }
 
-                                        // Wacht tot de knop is ingedrukt (GPIO 18 gaat LOW)
-                                        while (gpio_get_level(CONFIG_BUTTON_GPIO) == 1) {
-                                            vTaskDelay(pdMS_TO_TICKS(50));
+                                        bool resume_program = false;
+                                        while (!resume_program) {
+                                            // Check physical button (Active-LOW)
+                                            if (gpio_get_level(CONFIG_BUTTON_GPIO) == 0) {
+                                                // Wait for release to debounce
+                                                while (gpio_get_level(CONFIG_BUTTON_GPIO) == 0) {
+                                                    vTaskDelay(pdMS_TO_TICKS(20));
+                                                }
+                                                resume_program = true;
+                                                break;
+                                            }
+
+                                            // Check UART for PC commands
+                                            int len = uart_read_bytes(UART_NUM, data, BUF_SIZE, 10 / portTICK_PERIOD_MS);
+                                            if (len > 0) {
+                                                for (int i = 0; i < len; i++) {
+                                                    char c = data[i];
+                                                    if (c == '\n' || c == '\r') {
+                                                        line[line_idx] = '\0';
+                                                        if (line_idx > 0) {
+                                                            gcode_command_t pc_cmd;
+                                                            if (gcode_parse_line(line, &pc_cmd)) {
+                                                                if (pc_cmd.command == 'M' && pc_cmd.code == 108) {
+                                                                    resume_program = true;
+                                                                    break;
+                                                                }
+                                                                if (pc_cmd.command == 'M' && (pc_cmd.code == 112 || pc_cmd.code == 410)) {
+                                                                    motion_stop();
+                                                                    uart_write_bytes(UART_NUM, "Emergency Stop Activated! Program Aborted.\nok\n", 49);
+                                                                    line_idx = 0;
+                                                                    goto m0_aborted;
+                                                                }
+                                                            } else {
+                                                                // Check for plain text commands like "START" or "RESUME"
+                                                                char clean_cmd[32];
+                                                                int k = 0;
+                                                                for (int m = 0; line[m] && k < 30; m++) {
+                                                                    if (!isspace((int)line[m])) {
+                                                                        clean_cmd[k++] = toupper((int)line[m]);
+                                                                    }
+                                                                }
+                                                                clean_cmd[k] = '\0';
+                                                                if (strcmp(clean_cmd, "START") == 0 || strcmp(clean_cmd, "RESUME") == 0) {
+                                                                    resume_program = true;
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                        line_idx = 0;
+                                                    } else if (line_idx < sizeof(line) - 1) {
+                                                        line[line_idx++] = (char)c;
+                                                    }
+                                                }
+                                            }
+                                            vTaskDelay(pdMS_TO_TICKS(10));
                                         }
 
-                                        // Wacht tot de knop is losgelaten (GPIO 18 gaat terug HIGH) om dubbel-trigger te voorkomen
-                                        while (gpio_get_level(CONFIG_BUTTON_GPIO) == 0) {
-                                            vTaskDelay(pdMS_TO_TICKS(50));
-                                        }
-
-                                        uart_write_bytes(UART_NUM, "Knop ingedrukt! Hervat programma.\nok\n", 38);
+                                        uart_write_bytes(UART_NUM, "Programma hervat.\nok\n", 22);
+                                    m0_aborted:
                                         break;
                                     }
                                     case 30: {
