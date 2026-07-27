@@ -173,6 +173,24 @@ float hx711_get_instant_weight(void) {
     return w;
 }
 
+float hx711_get_direct_stable_weight(void) {
+    float sum = 0;
+    int valid = 0;
+    for (int i = 0; i < 3; i++) {
+        long raw = hx711_read_raw();
+        if (raw != 0 && raw != -8388608) {
+            float w = (float)(hx_cfg.offset - raw) / hx_cfg.divider;
+            w = hx711_apply_calibration(w);
+            sum += w;
+            valid++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    float final_w = (valid > 0) ? (sum / valid) : 0.0f;
+    if (fabs(final_w) < 0.05f) return 0.0f;
+    return final_w;
+}
+
 bool hx711_is_online(void) {
     return is_online;
 }

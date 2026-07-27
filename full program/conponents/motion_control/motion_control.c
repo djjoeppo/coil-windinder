@@ -272,20 +272,6 @@ bool motion_is_idle(void) {
     return state == IDLE && home_state == HOME_IDLE;
 }
 
-static float get_stable_instant_weight(void) {
-    float sum = 0;
-    int valid = 0;
-    for (int i = 0; i < 5; i++) {
-        float w = hx711_get_instant_weight();
-        if (w != 0.0f) {
-            sum += w;
-            valid++;
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    return (valid > 0) ? (sum / valid) : 0.0f;
-}
-
 void motion_start_force_move(float target_weight_kg) {
     portENTER_CRITICAL(&motion_mux);
     state = FORCE_SEEKING;
@@ -296,9 +282,8 @@ void motion_start_force_move(float target_weight_kg) {
     int stability_count = 0;
 
     while (stability_count < 20) {
-        // Use a highly responsive 5-point moving average over 50ms of the raw instant weights
-        // This is extremely responsive (lag-free) and completely filters out electrical noise
-        float current_weight = get_stable_instant_weight();
+        // Use direct stable weight reading with 3-point noise averaging and zero core-0 task starvation lag
+        float current_weight = hx711_get_direct_stable_weight();
         float diff = target_weight_kg - current_weight;
 
         if (fabs(diff) <= 0.05f) {
@@ -308,27 +293,21 @@ void motion_start_force_move(float target_weight_kg) {
             stability_count = 0;
             float abs_diff = fabs(diff);
             int steps = 1;
-            int delay_ms = 40;
+            int delay_ms = 80;
 
-            // If we are still in the air (weight is very low), descend rapidly
-            if (current_weight <= 0.15f) {
-                steps = 150;
-                delay_ms = 10; // High-speed approach through the air
+            // Safe, fast approach and proportional scaling to avoid overshoot
+            if (abs_diff > 1.2f) {
+                steps = 40;
+                delay_ms = 30;  // High-speed approach when far
+            } else if (abs_diff > 0.6f) {
+                steps = 20;
+                delay_ms = 40;
+            } else if (abs_diff > 0.2f) {
+                steps = 5;
+                delay_ms = 60;
             } else {
-                // Proportional discrete steps and long settling delays when touching the spool
-                if (abs_diff > 0.6f) {
-                    steps = 60;
-                    delay_ms = 40;  // Large steps, let filter stabilize
-                } else if (abs_diff > 0.3f) {
-                    steps = 20;
-                    delay_ms = 60;
-                } else if (abs_diff > 0.1f) {
-                    steps = 5;
-                    delay_ms = 80;
-                } else {
-                    steps = 1;
-                    delay_ms = 100; // Single step micro-adjustments
-                }
+                steps = 1;
+                delay_ms = 80; // Ultra-fine stepping
             }
 
             bool move_down = (diff > 0);
