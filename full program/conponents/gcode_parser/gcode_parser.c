@@ -39,7 +39,7 @@ bool gcode_parse_line(const char* line, gcode_command_t* cmd) {
         cmd->command = clean_line[0];
         cmd->code = atoi(clean_line + 1);
         
-        for (int i = 1; clean_line[i] != '\0'; i++) {
+        for (int i = 0; clean_line[i] != '\0'; i++) {
             char c = clean_line[i];
             char* endptr;
             if (c == 'X' && !cmd->has_x) {

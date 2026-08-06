@@ -190,7 +190,7 @@ void app_main(void) {
                                     case 114: {
                                         char msg[128];
                                         float weight = hx711_get_weight();
-                                        int l = snprintf(msg, sizeof(msg), "X:%.2f Y:%.2f Z:%.2f A:%.2f LOADCELL: %.3f kg\nok\n", 
+                                        int l = snprintf(msg, sizeof(msg), "X:%.2f Y:%.2f Z:%.2f A:%.2f W:%.3f\nok\n",
                                             (float)motion_get_position(0)/X_STEPS_PER_MM,
                                             (float)motion_get_position(1)/Y_STEPS_PER_MM,
                                             (float)motion_get_position(2)/Z_STEPS_PER_MM,
