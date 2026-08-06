@@ -1,0 +1,3 @@
+## 2025-08-06 - [G-code Parser Bottleneck in ESP-IDF]
+**Learning:** G-code parsing frequently suffers from scanning bottlenecks when using multiple passes of `strchr` to look for keys (like X, Y, Z, A, F) sequentially, causing O(K * N) complexity. Furthermore, standard library functions like `isspace()` and `toupper()` carry heavy overhead due to locale-dependent lookups in standard C libraries, especially in embedded/real-time environments.
+**Action:** Implement single-pass scanner algorithms that use `strtof`'s `endptr` to fast-forward the parsing index over parsed numbers, and use lightweight, locale-independent ASCII-only macros for character processing.
