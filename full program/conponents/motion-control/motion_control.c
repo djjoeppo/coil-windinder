@@ -10,8 +10,19 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include <math.h>
+#include "soc/soc.h"
+#include "soc/gpio_reg.h"
+
+#ifndef REG_WRITE
+#define REG_WRITE(_r, _v)    (*(volatile uint32_t *)(_r)) = (_v)
+#endif
 
 static const char *TAG = "MOTION_CONTROL";
+
+// Precalculated register addresses and masks for ultra-fast step generation in ISR
+static uint32_t step_pin_masks[4] = {0};
+static uint32_t step_pin_w1ts_regs[4] = {0};
+static uint32_t step_pin_w1tc_regs[4] = {0};
 
 typedef enum { IDLE, MOVING, FORCE_SEEKING } motion_state_t;
 typedef enum { HOME_IDLE, HOME_FAST_SEEK, HOME_BACKOFF, HOME_SLOW_SEEK } home_state_t;
@@ -67,12 +78,14 @@ static bool IRAM_ATTR motion_timer_cb(gptimer_handle_t timer, const gptimer_alar
 
     if (phase) {
         for (int i = 0; i < 4; i++) {
-            if (do_step[i]) gpio_set_level(step_gpios[i], 1);
+            if (do_step[i]) {
+                REG_WRITE(step_pin_w1ts_regs[i], step_pin_masks[i]);
+            }
         }
     } else {
         for (int i = 0; i < 4; i++) {
             if (do_step[i]) {
-                gpio_set_level(step_gpios[i], 0);
+                REG_WRITE(step_pin_w1tc_regs[i], step_pin_masks[i]);
                 current_position[i] += move_dir[i];
             }
             if (dominant_steps_remaining > 1) {
@@ -103,6 +116,18 @@ void motion_init(void) {
             .pull_up_en = 1,
         };
         gpio_config(&io_conf);
+
+        // Precalculate register addresses and masks for ultra-fast step generation
+        int pin = step_gpios[i];
+        if (pin < 32) {
+            step_pin_masks[i] = (1UL << pin);
+            step_pin_w1ts_regs[i] = GPIO_OUT_W1TS_REG;
+            step_pin_w1tc_regs[i] = GPIO_OUT_W1TC_REG;
+        } else {
+            step_pin_masks[i] = (1UL << (pin - 32));
+            step_pin_w1ts_regs[i] = GPIO_OUT1_W1TS_REG;
+            step_pin_w1tc_regs[i] = GPIO_OUT1_W1TC_REG;
+        }
     }
 
     gptimer_config_t timer_config = {

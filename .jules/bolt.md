@@ -1,0 +1,3 @@
+## 2025-02-12 - Ultra-Fast Stepper ISR Generation on ESP32
+**Learning:** Calling `gpio_set_level()` inside high-frequency interrupts (e.g., a 100kHz stepper motor GPTimer ISR) on ESP32 is highly inefficient due to function call overhead, pin lookup tables, and safety bounds checks. By precalculating direct register addresses (`GPIO_OUT_W1TS_REG`, `GPIO_OUT_W1TC_REG` for pins < 32 and `GPIO_OUT1_W1TS_REG`, `GPIO_OUT1_W1TC_REG` for pins >= 32) and masks in a mutable static variable array during initialization, we can eliminate branching, loop overhead, and function calls.
+**Action:** Always precalculate and cache GPIO bitmasks and register targets for fast-path code (like stepper pulse generation ISRs) to avoid slow standard APIs.
