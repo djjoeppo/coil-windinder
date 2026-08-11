@@ -27,6 +27,24 @@ static volatile long error_acc[4] = {0, 0, 0, 0};
 static volatile int move_dir[4] = {0, 0, 0, 0};
 static volatile bool do_step[4] = {false, false, false, false};
 
+// Precalculated direct register access pointers and masks for fast step generation inside ISR
+#ifndef GPIO_OUT_W1TS_REG
+#define GPIO_OUT_W1TS_REG   0x3FF44008
+#endif
+#ifndef GPIO_OUT_W1TC_REG
+#define GPIO_OUT_W1TC_REG   0x3FF4400C
+#endif
+#ifndef GPIO_OUT1_W1TS_REG
+#define GPIO_OUT1_W1TS_REG  0x3FF44014
+#endif
+#ifndef GPIO_OUT1_W1TC_REG
+#define GPIO_OUT1_W1TC_REG  0x3FF44018
+#endif
+
+static volatile uint32_t *step_reg_set[4] = {NULL, NULL, NULL, NULL};
+static volatile uint32_t *step_reg_clear[4] = {NULL, NULL, NULL, NULL};
+static uint32_t step_mask[4] = {0, 0, 0, 0};
+
 static volatile long dominant_steps_total = 0;
 static volatile long dominant_steps_remaining = 0;
 
@@ -67,12 +85,14 @@ static bool IRAM_ATTR motion_timer_cb(gptimer_handle_t timer, const gptimer_alar
 
     if (phase) {
         for (int i = 0; i < 4; i++) {
-            if (do_step[i]) gpio_set_level(step_gpios[i], 1);
+            if (do_step[i]) {
+                *step_reg_set[i] = step_mask[i];
+            }
         }
     } else {
         for (int i = 0; i < 4; i++) {
             if (do_step[i]) {
-                gpio_set_level(step_gpios[i], 0);
+                *step_reg_clear[i] = step_mask[i];
                 current_position[i] += move_dir[i];
             }
             if (dominant_steps_remaining > 1) {
@@ -103,6 +123,18 @@ void motion_init(void) {
             .pull_up_en = 1,
         };
         gpio_config(&io_conf);
+
+        // Precalculate register addresses and masks for step GPIOs to avoid gpio_set_level() overhead in the high-frequency ISR
+        int pin = step_gpios[i];
+        if (pin < 32) {
+            step_reg_set[i] = (volatile uint32_t *)GPIO_OUT_W1TS_REG;
+            step_reg_clear[i] = (volatile uint32_t *)GPIO_OUT_W1TC_REG;
+            step_mask[i] = (1UL << pin);
+        } else {
+            step_reg_set[i] = (volatile uint32_t *)GPIO_OUT1_W1TS_REG;
+            step_reg_clear[i] = (volatile uint32_t *)GPIO_OUT1_W1TC_REG;
+            step_mask[i] = (1UL << (pin - 32));
+        }
     }
 
     gptimer_config_t timer_config = {
