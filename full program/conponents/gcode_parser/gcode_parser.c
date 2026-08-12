@@ -2,41 +2,75 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <ctype.h>
 
-static float get_value(const char* s, char key, bool* found) {
-    const char* p = strchr(s, key);
-    if (p) {
-        *found = true;
-        return strtof(p + 1, NULL);
+// --- BOLT PERFORMANCE OPTIMIZATIONS ---
+// 1. Replaced standard locale-dependent isspace() with a fast ASCII-only inline check
+//    to eliminate locale/thread-safety check overhead.
+static inline bool is_whitespace_ascii(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
+}
+
+// 2. Replaced standard locale-dependent toupper() with a fast ASCII-only inline macro-style logic.
+static inline char to_upper_ascii(char c) {
+    if (c >= 'a' && c <= 'z') {
+        return c - 'a' + 'A';
     }
-    *found = false;
-    return 0.0f;
+    return c;
 }
 
 bool gcode_parse_line(const char* line, gcode_command_t* cmd) {
-    if (!line || strlen(line) == 0) return false;
+    // Avoid strlen() call to eliminate a redundant pass over the line.
+    if (!line || line[0] == '\0') return false;
 
     memset(cmd, 0, sizeof(gcode_command_t));
     
     char clean_line[130]; // Slightly larger than input line to be safe
     int j = 0;
     for (int i = 0; line[i] && j < 128; i++) {
-        if (!isspace((int)line[i])) {
-            clean_line[j++] = toupper((int)line[i]);
+        char c = line[i];
+        if (!is_whitespace_ascii(c)) {
+            clean_line[j++] = to_upper_ascii(c);
         }
     }
     clean_line[j] = '\0';
 
-    if (clean_line[0] == 'G' || clean_line[0] == 'M') {
-        cmd->command = clean_line[0];
-        cmd->code = atoi(clean_line + 1);
+    char first = clean_line[0];
+    if (first == 'G' || first == 'M') {
+        cmd->command = first;
+
+        // 3. Fast inline integer parser to replace atoi() for the G/M code,
+        //    saving library call overhead.
+        int code = 0;
+        int i = 1;
+        while (clean_line[i] >= '0' && clean_line[i] <= '9') {
+            code = code * 10 + (clean_line[i] - '0');
+            i++;
+        }
+        cmd->code = code;
         
-        cmd->x = get_value(clean_line, 'X', &cmd->has_x);
-        cmd->y = get_value(clean_line, 'Y', &cmd->has_y);
-        cmd->z = get_value(clean_line, 'Z', &cmd->has_z);
-        cmd->a = get_value(clean_line, 'A', &cmd->has_a);
-        cmd->f = get_value(clean_line, 'F', &cmd->has_f);
+        // 4. Single-pass parameter scanning to replace 5 separate strchr() scans.
+        //    This iterates through clean_line exactly once, registering pointers
+        //    for X, Y, Z, A, and F values.
+        const char* p_x = NULL;
+        const char* p_y = NULL;
+        const char* p_z = NULL;
+        const char* p_a = NULL;
+        const char* p_f = NULL;
+
+        for (int i = 0; clean_line[i]; i++) {
+            char c = clean_line[i];
+            if (c == 'X') { if (!p_x) p_x = &clean_line[i + 1]; }
+            else if (c == 'Y') { if (!p_y) p_y = &clean_line[i + 1]; }
+            else if (c == 'Z') { if (!p_z) p_z = &clean_line[i + 1]; }
+            else if (c == 'A') { if (!p_a) p_a = &clean_line[i + 1]; }
+            else if (c == 'F') { if (!p_f) p_f = &clean_line[i + 1]; }
+        }
+
+        if (p_x) { cmd->has_x = true; cmd->x = strtof(p_x, NULL); }
+        if (p_y) { cmd->has_y = true; cmd->y = strtof(p_y, NULL); }
+        if (p_z) { cmd->has_z = true; cmd->z = strtof(p_z, NULL); }
+        if (p_a) { cmd->has_a = true; cmd->a = strtof(p_a, NULL); }
+        if (p_f) { cmd->has_f = true; cmd->f = strtof(p_f, NULL); }
         
         return true;
     }

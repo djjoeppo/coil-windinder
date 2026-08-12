@@ -1,0 +1,3 @@
+## 2025-02-15 - Redundant Linear Scans & Locale Overhead in G-Code Parsers
+**Learning:** Standard library functions like `isspace` and `toupper` are locale-dependent and can introduce significant CPU overhead due to thread-safety or locale lookup table checks. Additionally, using multiple `strchr` calls to find keys (X, Y, Z, A, F) sequentially in a cleaned G-code string causes redundant linear scans of the string (O(K * N) where K is number of parameters and N is string length).
+**Action:** Replace `isspace` and `toupper` with fast, locale-independent ASCII-only inline functions. Perform a single-pass O(N) scan of the cleaned string to locate all parameter keys and assign pointers, entirely eliminating redundant linear scans and extra library call overhead.
