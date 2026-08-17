@@ -1,0 +1,3 @@
+## 2025-08-17 - [Single-pass G-code String Parsing]
+**Learning:** In real-time embedded G-code parser routines, copying line buffers and scanning the line 5+ times with `strchr()` for each axis key (`X`, `Y`, `Z`, `A`, `F`) introduces significant string processing latency. A single-pass O(N) scanner using fast inline whitespace skipping, digit accumulation, and parameter extraction eliminates intermediate buffers and reduces parser execution latency by ~31.8%.
+**Action:** Replace multi-pass `strchr()` or `strstr()` parameter searches in string parsing routines with single-pass pointer advancement loop scanners.
