@@ -2,44 +2,101 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <ctype.h>
 
-static float get_value(const char* s, char key, bool* found) {
-    const char* p = strchr(s, key);
-    if (p) {
-        *found = true;
-        return strtof(p + 1, NULL);
-    }
-    *found = false;
-    return 0.0f;
+// Fast inline helpers to avoid libc locale/function call overhead in embedded command parser
+static inline bool is_ascii_space(char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
+static inline char to_ascii_upper(char c) {
+    return (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+}
+
+/*
+ * Optimized single-pass O(N) G-code parser.
+ * Eliminates intermediate string buffer copying, multiple strchr full-line scans,
+ * and redundant character normalization passes.
+ */
 bool gcode_parse_line(const char* line, gcode_command_t* cmd) {
-    if (!line || strlen(line) == 0) return false;
+    if (!line) return false;
+
+    const char* p = line;
+
+    // Skip leading whitespace
+    while (*p && is_ascii_space(*p)) {
+        p++;
+    }
+
+    char first_char = to_ascii_upper(*p);
+    if (first_char != 'G' && first_char != 'M') {
+        return false;
+    }
 
     memset(cmd, 0, sizeof(gcode_command_t));
-    
-    char clean_line[130]; // Slightly larger than input line to be safe
-    int j = 0;
-    for (int i = 0; line[i] && j < 128; i++) {
-        if (!isspace((int)line[i])) {
-            clean_line[j++] = toupper((int)line[i]);
+    cmd->command = first_char;
+    p++; // Skip 'G' or 'M'
+
+    // Fast inline base-10 integer parser for command code (e.g. 0, 1, 28, 114)
+    int code = 0;
+    bool has_code = false;
+    while (*p >= '0' && *p <= '9') {
+        code = code * 10 + (*p - '0');
+        has_code = true;
+        p++;
+    }
+    if (!has_code) {
+        return false;
+    }
+    cmd->code = code;
+
+    // Single pass scan for command parameters (X, Y, Z, A, F)
+    while (*p) {
+        // Skip whitespace
+        while (*p && is_ascii_space(*p)) {
+            p++;
+        }
+
+        if (!*p || *p == ';') break; // End of line or start of G-code comment
+
+        char key = to_ascii_upper(*p);
+        p++;
+
+        char* endptr = NULL;
+        float val = strtof(p, &endptr);
+
+        if (endptr == p) {
+            // Could not parse a float; skip invalid character to prevent infinite loop
+            continue;
+        }
+
+        p = endptr;
+
+        switch (key) {
+            case 'X':
+                cmd->x = val;
+                cmd->has_x = true;
+                break;
+            case 'Y':
+                cmd->y = val;
+                cmd->has_y = true;
+                break;
+            case 'Z':
+                cmd->z = val;
+                cmd->has_z = true;
+                break;
+            case 'A':
+                cmd->a = val;
+                cmd->has_a = true;
+                break;
+            case 'F':
+                cmd->f = val;
+                cmd->has_f = true;
+                break;
+            default:
+                // Other parameters (e.g. S, P, E) are ignored but parsed safely
+                break;
         }
     }
-    clean_line[j] = '\0';
 
-    if (clean_line[0] == 'G' || clean_line[0] == 'M') {
-        cmd->command = clean_line[0];
-        cmd->code = atoi(clean_line + 1);
-        
-        cmd->x = get_value(clean_line, 'X', &cmd->has_x);
-        cmd->y = get_value(clean_line, 'Y', &cmd->has_y);
-        cmd->z = get_value(clean_line, 'Z', &cmd->has_z);
-        cmd->a = get_value(clean_line, 'A', &cmd->has_a);
-        cmd->f = get_value(clean_line, 'F', &cmd->has_f);
-        
-        return true;
-    }
-
-    return false;
+    return true;
 }
