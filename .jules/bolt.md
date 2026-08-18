@@ -1,0 +1,3 @@
+## 2025-02-18 - Optimized G-code Parser Latency
+**Learning:** Parsing G-code lines via intermediate fixed-size string copies, `isspace`/`toupper` loop transformations, and repeated `strchr` + `strtof` scans causes substantial CPU latency and locale lookup overhead. A single-pass inline scanner with fast inline whitespace/case conversion and direct floating-point parsing (`fast_atof`) avoids allocations, string copies, and multi-pass string scans.
+**Action:** Use single-pass zero-allocation parsing with inline conversion routines when processing continuous serial text streams in embedded environments.
