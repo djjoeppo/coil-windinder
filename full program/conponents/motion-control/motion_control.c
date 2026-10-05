@@ -9,6 +9,7 @@
 #include "hx711.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "soc/gpio_reg.h"
 #include <math.h>
 
 static const char *TAG = "MOTION_CONTROL";
@@ -39,6 +40,8 @@ static volatile bool timer_running = false;
 static portMUX_TYPE motion_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static int step_gpios[4] = { CONFIG_X_STEP_GPIO, CONFIG_Y_STEP_GPIO, CONFIG_Z_STEP_GPIO, CONFIG_A_STEP_GPIO };
+static uint32_t step_mask_low[4];
+static uint32_t step_mask_high[4];
 static int limit_gpios[4] = { CONFIG_X_LIMIT_GPIO, CONFIG_Y_LIMIT_GPIO, CONFIG_Z_LIMIT_GPIO, CONFIG_A_LIMIT_GPIO };
 static bool axis_is_nc[4] = { false, false, true, true };
 
@@ -66,13 +69,23 @@ static bool IRAM_ATTR motion_timer_cb(gptimer_handle_t timer, const gptimer_alar
     phase = !phase;
 
     if (phase) {
-        for (int i = 0; i < 4; i++) {
-            if (do_step[i]) gpio_set_level(step_gpios[i], 1);
-        }
-    } else {
+        uint32_t set_low = 0;
+        uint32_t set_high = 0;
         for (int i = 0; i < 4; i++) {
             if (do_step[i]) {
-                gpio_set_level(step_gpios[i], 0);
+                set_low |= step_mask_low[i];
+                set_high |= step_mask_high[i];
+            }
+        }
+        if (set_low) REG_WRITE(GPIO_OUT_W1TS_REG, set_low);
+        if (set_high) REG_WRITE(GPIO_OUT1_W1TS_REG, set_high);
+    } else {
+        uint32_t clr_low = 0;
+        uint32_t clr_high = 0;
+        for (int i = 0; i < 4; i++) {
+            if (do_step[i]) {
+                clr_low |= step_mask_low[i];
+                clr_high |= step_mask_high[i];
                 current_position[i] += move_dir[i];
             }
             if (dominant_steps_remaining > 1) {
@@ -85,6 +98,8 @@ static bool IRAM_ATTR motion_timer_cb(gptimer_handle_t timer, const gptimer_alar
                 }
             }
         }
+        if (clr_low) REG_WRITE(GPIO_OUT_W1TC_REG, clr_low);
+        if (clr_high) REG_WRITE(GPIO_OUT1_W1TC_REG, clr_high);
         dominant_steps_remaining--;
     }
     return false;
@@ -103,6 +118,17 @@ void motion_init(void) {
             .pull_up_en = 1,
         };
         gpio_config(&io_conf);
+
+        if (step_gpios[i] >= 0 && step_gpios[i] < 32) {
+            step_mask_low[i] = (1U << step_gpios[i]);
+            step_mask_high[i] = 0;
+        } else if (step_gpios[i] >= 32 && step_gpios[i] < 40) {
+            step_mask_low[i] = 0;
+            step_mask_high[i] = (1U << (step_gpios[i] - 32));
+        } else {
+            step_mask_low[i] = 0;
+            step_mask_high[i] = 0;
+        }
     }
 
     gptimer_config_t timer_config = {
