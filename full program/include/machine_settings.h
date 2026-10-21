@@ -67,4 +67,13 @@
 #define CONFIG_HX711_DOUT_GPIO  4   
 #define CONFIG_HX711_SCK_GPIO   5
 
+// --- INPUT BUTTON CONFIGURATION ---
+#define CONFIG_BUTTON_GPIO      18  // Physical button input pin (with internal pullup)
+
+// --- BACKLASH (SPELING) COMPENSATIE ---
+#define BACKLASH_X_STEPS        15  // Compensatiestappen voor mechanische speling op de X-as
+#define BACKLASH_Y_STEPS        15  // Compensatiestappen voor mechanische speling op de Y-as
+#define BACKLASH_Z_STEPS        15  // Compensatiestappen voor mechanische speling op de Z-as
+#define BACKLASH_A_STEPS        0   // Geen speling op de rotatie-as
+
 #endif // MACHINE_SETTINGS_H

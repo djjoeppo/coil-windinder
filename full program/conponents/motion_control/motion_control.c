@@ -10,14 +10,35 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include <math.h>
+#include "soc/gpio_reg.h"
 
 static const char *TAG = "MOTION_CONTROL";
+
+static inline void IRAM_ATTR gpio_set_level_fast(int gpio_num, uint32_t level) {
+    if (gpio_num < 32) {
+        if (level) {
+            REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << gpio_num));
+        } else {
+            REG_WRITE(GPIO_OUT_W1TC_REG, (1UL << gpio_num));
+        }
+    } else {
+        if (level) {
+            REG_WRITE(GPIO_OUT1_W1TS_REG, (1UL << (gpio_num - 32)));
+        } else {
+            REG_WRITE(GPIO_OUT1_W1TC_REG, (1UL << (gpio_num - 32)));
+        }
+    }
+}
 
 typedef enum { IDLE, MOVING, FORCE_SEEKING } motion_state_t;
 typedef enum { HOME_IDLE, HOME_FAST_SEEK, HOME_BACKOFF, HOME_SLOW_SEEK } home_state_t;
 
 static RingbufHandle_t move_buffer = NULL;
 static volatile motion_state_t state = IDLE;
+static volatile bool tension_lock_active = false;
+static volatile float tension_lock_target = 0.0f;
+static volatile int prev_move_dir[4] = {0, 0, 0, 0};
+static const int backlash_steps[4] = { BACKLASH_X_STEPS, BACKLASH_Y_STEPS, BACKLASH_Z_STEPS, BACKLASH_A_STEPS };
 static volatile home_state_t home_state = HOME_IDLE;
 static volatile int homing_axis = -1;
 
@@ -50,14 +71,18 @@ static bool IRAM_ATTR is_limit_triggered(int axis) {
 
 static bool IRAM_ATTR motion_timer_cb(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
     if (state != MOVING || dominant_steps_remaining <= 0) {
+        portENTER_CRITICAL_ISR(&motion_mux);
         state = IDLE;
+        portEXIT_CRITICAL_ISR(&motion_mux);
         return false;
     }
 
     if (homing_axis >= 0 && home_state != HOME_BACKOFF) {
         if (is_limit_triggered(homing_axis)) {
+            portENTER_CRITICAL_ISR(&motion_mux);
             state = IDLE;
             dominant_steps_remaining = 0;
+            portEXIT_CRITICAL_ISR(&motion_mux);
             return false;
         }
     }
@@ -67,12 +92,13 @@ static bool IRAM_ATTR motion_timer_cb(gptimer_handle_t timer, const gptimer_alar
 
     if (phase) {
         for (int i = 0; i < 4; i++) {
-            if (do_step[i]) gpio_set_level(step_gpios[i], 1);
+            if (do_step[i]) gpio_set_level_fast(step_gpios[i], 1);
         }
     } else {
+        portENTER_CRITICAL_ISR(&motion_mux);
         for (int i = 0; i < 4; i++) {
             if (do_step[i]) {
-                gpio_set_level(step_gpios[i], 0);
+                gpio_set_level_fast(step_gpios[i], 0);
                 current_position[i] += move_dir[i];
             }
             if (dominant_steps_remaining > 1) {
@@ -86,6 +112,7 @@ static bool IRAM_ATTR motion_timer_cb(gptimer_handle_t timer, const gptimer_alar
             }
         }
         dominant_steps_remaining--;
+        portEXIT_CRITICAL_ISR(&motion_mux);
     }
     return false;
 }
@@ -137,6 +164,18 @@ static void motion_update_speed(float speed_hz) {
 
 void motion_start_move(move_t *move) {
     portENTER_CRITICAL(&motion_mux);
+
+    // Apply Backlash Compensation
+    for (int i = 0; i < 4; i++) {
+        if (move->steps[i] != 0) {
+            int new_dir = (move->steps[i] > 0) ? 1 : -1;
+            if (prev_move_dir[i] != 0 && new_dir != prev_move_dir[i]) {
+                move->steps[i] += (new_dir > 0) ? backlash_steps[i] : -backlash_steps[i];
+            }
+            prev_move_dir[i] = new_dir;
+        }
+    }
+
     dominant_steps_total = 0;
     for (int i = 0; i < 4; i++) {
         step_count[i] = labs(move->steps[i]);
@@ -198,6 +237,37 @@ long motion_get_position(int axis) {
     return pos;
 }
 
+void motion_stop(void) {
+    portENTER_CRITICAL(&motion_mux);
+    state = IDLE;
+    home_state = HOME_IDLE;
+    homing_axis = -1;
+    dominant_steps_remaining = 0;
+    portEXIT_CRITICAL(&motion_mux);
+
+    if (move_buffer != NULL) {
+        size_t item_size;
+        // Drain the ringbuffer completely
+        while (1) {
+            void *item = xRingbufferReceive(move_buffer, &item_size, 0);
+            if (item == NULL) break;
+            vRingbufferReturnItem(move_buffer, item);
+        }
+    }
+}
+
+bool motion_get_limit_triggered(int axis) {
+    if (axis < 0 || axis >= 4) return false;
+    return is_limit_triggered(axis);
+}
+
+void motion_set_tension_lock(bool active, float target_kg) {
+    portENTER_CRITICAL(&motion_mux);
+    tension_lock_active = active;
+    tension_lock_target = target_kg;
+    portEXIT_CRITICAL(&motion_mux);
+}
+
 bool motion_is_idle(void) {
     return state == IDLE && home_state == HOME_IDLE;
 }
@@ -207,49 +277,93 @@ void motion_start_force_move(float target_weight_kg) {
     state = FORCE_SEEKING;
     portEXIT_CRITICAL(&motion_mux);
 
-    ESP_LOGI(TAG, "Starting Force Seek to %.2f kg", target_weight_kg);
+    ESP_LOGI(TAG, "Starting Adaptive Force Seek to %.2f kg", target_weight_kg);
     
     int stability_count = 0;
-    bool slow_phase = false;
+
+    // Adaptive rigidity estimation (conservative default 200 steps per kg)
+    static float steps_per_kg = 200.0f;
+
+    // Read starting weight and position
+    float prev_weight = hx711_get_direct_stable_weight();
+    portENTER_CRITICAL(&motion_mux);
+    long prev_pos = current_position[2];
+    portEXIT_CRITICAL(&motion_mux);
 
     while (stability_count < 20) {
-        float current_weight = hx711_get_weight();
-        if (!slow_phase && current_weight >= 1.0f) {
-            slow_phase = true;
-            ESP_LOGI(TAG, "Force Seek: entering slow phase");
+        // Read current weight using direct 3-point noise-averaged sensor access
+        float current_weight = hx711_get_direct_stable_weight();
+        float diff = target_weight_kg - current_weight;
+
+        portENTER_CRITICAL(&motion_mux);
+        long current_pos = current_position[2];
+        portEXIT_CRITICAL(&motion_mux);
+
+        // Update steps_per_kg based on the actual physical weight change from the last movement
+        float delta_w = current_weight - prev_weight;
+        long delta_s = labs(current_pos - prev_pos);
+        if (delta_s > 10 && fabs(delta_w) > 0.1f) {
+            float measured_steps_per_kg = (float)delta_s / fabs(delta_w);
+            // Constrain estimate to a safe, physical range [100.0, 800.0] and apply EMA smoothing
+            if (measured_steps_per_kg >= 100.0f && measured_steps_per_kg <= 800.0f) {
+                steps_per_kg = (measured_steps_per_kg * 0.3f) + (steps_per_kg * 0.7f);
+            }
         }
 
-        float diff = target_weight_kg - current_weight;
+        prev_weight = current_weight;
+        prev_pos = current_pos;
+
         if (fabs(diff) <= 0.05f) {
             stability_count++;
+            vTaskDelay(pdMS_TO_TICKS(100)); // Sleep between stability checks
         } else {
             stability_count = 0;
-            int steps = slow_phase ? 5 : 40;
-            bool move_down = (diff > 0);
-            
-            portENTER_CRITICAL(&motion_mux);
-            long pos_z = current_position[2];
-            portEXIT_CRITICAL(&motion_mux);
+            float abs_diff = fabs(diff);
 
-            long next_pos = pos_z + (move_down ? steps : -steps);
-            if (next_pos < 0 || next_pos > (long)(Z_MAX_TRAVEL * Z_STEPS_PER_MM)) {
+            // Calculate required steps using our self-adaptive steps_per_kg verhouding
+            float required_steps = abs_diff * steps_per_kg;
+
+            // Apply 50% damping factor (relaxation) to completely prevent overshoot
+            int steps = (int)(required_steps * 0.50f);
+            if (steps < 1) steps = 1;      // Ensure we still make fine micro-steps
+            if (steps > 100) steps = 100;  // Cap maximum step size to stay safe
+
+            bool move_down = (diff > 0);
+
+            // Limit steps so we don't exceed boundaries
+            long max_z_steps = (long)(Z_MAX_TRAVEL * Z_STEPS_PER_MM);
+            if (move_down) {
+                if (current_pos + steps > max_z_steps) {
+                    steps = max_z_steps - current_pos;
+                }
+            } else {
+                if (current_pos - steps < 0) {
+                    steps = current_pos;
+                }
+            }
+
+            if (steps > 0) {
+                stepper_set_direction(2, move_down);
+                // Pulse Z stepper (100us pulse width)
+                for (int s = 0; s < steps; s++) {
+                    gpio_set_level_fast(step_gpios[2], 1);
+                    esp_rom_delay_us(100);
+                    gpio_set_level_fast(step_gpios[2], 0);
+                    esp_rom_delay_us(100);
+                }
+
+                portENTER_CRITICAL(&motion_mux);
+                current_position[2] += (move_down ? steps : -steps);
+                portEXIT_CRITICAL(&motion_mux);
+
+                // Wait 200ms after taking steps to let the wire tension physically settle
+                // and give the loadcell filter time to produce fresh stable values.
+                vTaskDelay(pdMS_TO_TICKS(200));
+            } else {
                 ESP_LOGW(TAG, "Force Seek: Soft limit reached!");
                 break;
             }
-
-            stepper_set_direction(2, move_down);
-            for(int s=0; s<steps; s++) {
-                gpio_set_level(step_gpios[2], 1);
-                esp_rom_delay_us(500);
-                gpio_set_level(step_gpios[2], 0);
-                esp_rom_delay_us(500);
-                portENTER_CRITICAL(&motion_mux);
-                current_position[2] += (move_down ? 1 : -1);
-                portEXIT_CRITICAL(&motion_mux);
-            }
         }
-        if (slow_phase) vTaskDelay(pdMS_TO_TICKS(50));
-        else vTaskDelay(pdMS_TO_TICKS(5));
 
         if (current_weight > OVERLOAD_THRESHOLD_KG) {
             ESP_LOGE(TAG, "Force Seek: EMERGENCY OVERLOAD!");
@@ -273,6 +387,53 @@ void motion_control_task(void *pvParameters) {
             continue;
         }
 
+        if (state == IDLE && tension_lock_active) {
+            // Use stable EMA-filtered weight to completely filter out electrical noise from long cable
+            float current_weight = hx711_get_weight();
+            float diff = tension_lock_target - current_weight;
+            if (fabs(diff) > 0.05f) {
+                float abs_diff = fabs(diff);
+                int steps = 1;
+                if (abs_diff > 0.5f) {
+                    steps = 5;
+                } else {
+                    steps = 1;
+                }
+
+                bool move_down = (diff > 0);
+
+                portENTER_CRITICAL(&motion_mux);
+                long pos_z = current_position[2];
+                portEXIT_CRITICAL(&motion_mux);
+
+                long max_z_steps = (long)(Z_MAX_TRAVEL * Z_STEPS_PER_MM);
+                if (move_down) {
+                    if (pos_z + steps > max_z_steps) {
+                        steps = max_z_steps - pos_z;
+                    }
+                } else {
+                    if (pos_z - steps < 0) {
+                        steps = pos_z;
+                    }
+                }
+
+                if (steps > 0) {
+                    stepper_set_direction(2, move_down);
+                    for (int s = 0; s < steps; s++) {
+                        gpio_set_level_fast(step_gpios[2], 1);
+                        esp_rom_delay_us(500);
+                        gpio_set_level_fast(step_gpios[2], 0);
+                        esp_rom_delay_us(500);
+                    }
+                    portENTER_CRITICAL(&motion_mux);
+                    current_position[2] += (move_down ? steps : -steps);
+                    portEXIT_CRITICAL(&motion_mux);
+                }
+                vTaskDelay(pdMS_TO_TICKS(80)); // Delay to let the sensor update and physically stabilize
+                continue;
+            }
+        }
+
         uint64_t now = esp_timer_get_time();
         float dt = (now - last_time) / 1000000.0f;
         last_time = now;
@@ -289,14 +450,29 @@ void motion_control_task(void *pvParameters) {
                 // Kijk of er al een volgende beweging klaarstaat in de buffer
                 move_t *next_move = (move_t *)xRingbufferReceive(move_buffer, &item_size, 0);
                 if (next_move) {
+                    bool reverses_direction = false;
+                    for (int i = 0; i < 4; i++) {
+                        // Check of as van richting verandert tussen huidige en volgende beweging
+                        if (labs(next_move->steps[i]) > 0 && step_count[i] > 0) {
+                            int next_dir = (next_move->steps[i] > 0) ? 1 : -1;
+                            if (next_dir != move_dir[i]) {
+                                reverses_direction = true;
+                                break;
+                            }
+                        }
+                    }
+
                     float saved_speed = current_speed; // Onthoud de huidige vaart!
                     
                     motion_start_move(next_move);
                     
-                    // Schakel de snelheid vloeiend over in plaats van te resetten naar 0
+                    // Schakel de snelheid vloeiend over in plaats van te resetten naar 0,
+                    // BEHALVE als een as van richting verandert om stappenverlies te voorkomen!
                     portENTER_CRITICAL(&motion_mux);
-                    if (saved_speed > 10.0f) {
+                    if (!reverses_direction && saved_speed > 10.0f) {
                         current_speed = saved_speed; 
+                    } else {
+                        current_speed = 10.0f; // Reset naar een veilige startsnelheid bij richtingsverandering
                     }
                     portEXIT_CRITICAL(&motion_mux);
                     

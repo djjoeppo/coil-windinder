@@ -4,16 +4,13 @@
 #include <stdlib.h>
 #include <ctype.h>
 
-static float get_value(const char* s, char key, bool* found) {
-    const char* p = strchr(s, key);
-    if (p) {
-        *found = true;
-        return strtof(p + 1, NULL);
-    }
-    *found = false;
-    return 0.0f;
-}
-
+/**
+ * Optimized G-Code Parser
+ * Performs a single-pass O(N) scan to extract command keys X, Y, Z, A, F.
+ * This completely eliminates 5 redundant scans of the entire line with strchr(),
+ * and only invokes strtof() when a valid parameter key is actually encountered,
+ * significantly reducing Core 0 CPU utilization during G-code processing.
+ */
 bool gcode_parse_line(const char* line, gcode_command_t* cmd) {
     if (!line || strlen(line) == 0) return false;
 
@@ -32,12 +29,39 @@ bool gcode_parse_line(const char* line, gcode_command_t* cmd) {
         cmd->command = clean_line[0];
         cmd->code = atoi(clean_line + 1);
         
-        cmd->x = get_value(clean_line, 'X', &cmd->has_x);
-        cmd->y = get_value(clean_line, 'Y', &cmd->has_y);
-        cmd->z = get_value(clean_line, 'Z', &cmd->has_z);
-        cmd->a = get_value(clean_line, 'A', &cmd->has_a);
-        cmd->f = get_value(clean_line, 'F', &cmd->has_f);
-        
+        // Single-pass parser to extract keys 'X', 'Y', 'Z', 'A', 'F'
+        for (int i = 1; clean_line[i] != '\0'; ) {
+            char key = clean_line[i];
+            if (key == 'X' || key == 'Y' || key == 'Z' || key == 'A' || key == 'F') {
+                char* endptr;
+                float val = strtof(&clean_line[i + 1], &endptr);
+
+                if (key == 'X') {
+                    cmd->x = val;
+                    cmd->has_x = true;
+                } else if (key == 'Y') {
+                    cmd->y = val;
+                    cmd->has_y = true;
+                } else if (key == 'Z') {
+                    cmd->z = val;
+                    cmd->has_z = true;
+                } else if (key == 'A') {
+                    cmd->a = val;
+                    cmd->has_a = true;
+                } else if (key == 'F') {
+                    cmd->f = val;
+                    cmd->has_f = true;
+                }
+
+                if (endptr > &clean_line[i + 1]) {
+                    i = endptr - clean_line; // Jump past the parsed float
+                } else {
+                    i++;
+                }
+            } else {
+                i++;
+            }
+        }
         return true;
     }
 
